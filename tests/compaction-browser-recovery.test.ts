@@ -9,13 +9,14 @@ import { resolveChatGptWebModelMode } from "../src/adapters/chatgpt-web/model";
 import { ChatGptExternalTurnProgress } from "../src/adapters/chatgpt-web/turn-progress";
 
 test.each([
-  [true, false, true, false, false],
-  [false, false, true, false, false],
-  [true, true, true, false, false],
-  [true, false, false, false, false],
-  [true, false, true, true, false],
-  [true, true, false, false, true],
-])("browser turns preserve recovery, ordering and final-only tools (owned=%s, tools=%s, multipart=%s, size rejected=%s, retained=%s)", async (owned, tools, multipart, sizeRejected, retained) => {
+  [true, false, true, false, false, false],
+  [false, false, true, false, false, false],
+  [true, true, true, false, false, false],
+  [true, false, false, false, false, false],
+  [true, false, true, true, false, false],
+  [true, true, false, false, true, false],
+  [true, false, true, true, false, true],
+])("browser turns preserve recovery, ordering and final-only tools (owned=%s, tools=%s, multipart=%s, size rejected=%s, retained=%s, SSE=%s)", async (owned, tools, multipart, sizeRejected, retained, sseRejection) => {
   const diagnostics = mkdtempSync(join(tmpdir(), "compaction-observation-"));
   const cancellationCase = owned && !tools && !multipart;
   const effort = tools ? "xhigh" : "high";
@@ -47,7 +48,10 @@ test.each([
       actions.push(`effort:${effort}`);
       return resolveChatGptWebModelMode(model, effort, capabilities);
     },
-    captureSubmissionBaseline: async () => ({}),
+    captureSubmissionBaseline: async (_page: unknown, _text: string, acknowledged: unknown[] = []) => {
+      expect(acknowledged).toHaveLength(actions.filter(action => action === "ack").length);
+      return {};
+    },
     attachPrompt: async (_page: unknown, _text: string, localTools: boolean) => {
       expect(localTools).toBe(false);
       actions.push("attach:plain");
@@ -68,9 +72,12 @@ test.each([
         const request = { method: () => "POST", url: () => "https://chatgpt.com/backend-api/f/conversation", frame: () => frame };
         page.emit("request", request);
         page.emit("response", {
-          request: () => request, status: () => 413, headers: () => ({ "content-type": "application/json" }),
+          request: () => request, status: () => sseRejection ? 200 : 413,
+          headers: () => ({ "content-type": sseRejection ? "text/event-stream" : "application/json" }),
           json: async () => ({ detail: { code: "message_length_exceeds_limit" } }),
+          text: async () => 'data: {"error":"The message you submitted was too long, please edit it and resubmit.","error_code":"input_too_large","error_reason":"last_user_message"}\n\ndata: [DONE]\n\n',
         });
+        page.emit("requestfinished", request);
       }
       recoveryCallbacks.push(args[7]);
       actions.push("send");
@@ -92,7 +99,7 @@ test.each([
       }
       return {};
     },
-    waitForMultipartAcknowledgement: async () => { actions.push("ack"); },
+    waitForMultipartAcknowledgement: async () => { actions.push("ack"); return { identity: `stage:${actions.length}` }; },
   });
   if (retained) {
     // Exercise the real attachment path: the previous Send cleared its mention,
@@ -140,6 +147,8 @@ test.each([
       expect(released).toBeTrue();
       expect(page.listenerCount("request")).toBe(0);
       expect(page.listenerCount("response")).toBe(0);
+      expect(page.listenerCount("requestfinished")).toBe(0);
+      expect(page.listenerCount("requestfailed")).toBe(0);
       return;
     }
     await expect(run).rejects.toBe(finalResponse);

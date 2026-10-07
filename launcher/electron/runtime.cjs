@@ -1095,6 +1095,9 @@ class RuntimeHost {
     if (!current.configured) {
       throw new Error("Initialize the runtime before changing Bigger Context");
     }
+    if (enabled === true && current.config?.solAvailable !== true) {
+      throw new Error("Bigger Context requires Sol or Pro in the launcher's model list. It is unavailable for Luna and Think.");
+    }
     const mode = current.mode;
     const contextFlag = enabled === true ? "--bigger-context" : "--standard-context";
     if (this.launcherProfile === "development") {

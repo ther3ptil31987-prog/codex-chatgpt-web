@@ -348,6 +348,7 @@ test.each(["5.6", "6"] as const)("a retained %s checkpoint preserves model selec
   expect(captured?.modelFamily).toBe(family);
   expect(captured?.conversationKey).toBe(conversationKey);
   expect(captured?.requireRetainedConversation).toBeTrue();
+  expect(captured?.compaction).toBeTrue();
   expect(captured?.nativeConnector).toBeTrue();
   expect(captured?.capabilities.localToolsEnabled).toBeFalse();
   expect(browserRetired).toBeTrue();

@@ -275,7 +275,7 @@ test("macOS passkey sign-in is additive to the unchanged embedded login action",
 test("Bigger Context startup recommendation reuses the persisted setting and setup transaction", () => {
   assert.match(
     appSource,
-    /const \[biggerContextRecommendationOpen, setBiggerContextRecommendationOpen\] = useState\([\s\S]*?snapshot\.state\.browserInteractionMode === "automatic"[\s\S]*?snapshot\.state\.coreSetupComplete === true[\s\S]*?!snapshot\.state\.experimentalBiggerContext,/,
+    /const \[biggerContextRecommendationOpen, setBiggerContextRecommendationOpen\] = useState\([\s\S]*?snapshot\.state\.browserInteractionMode === "automatic"[\s\S]*?snapshot\.state\.coreSetupComplete === true[\s\S]*?snapshot\.state\.biggerContextAvailable === true[\s\S]*?!snapshot\.state\.experimentalBiggerContext,/,
   );
   assert.match(appSource, /&& !biggerContextRecommendationOpen;/);
   assert.match(appSource, /updateState\(await api!\.setBiggerContext\(enabled\)\)/);
@@ -545,6 +545,11 @@ test("fresh-conversation snapshot uses runtime configuration and mode switching 
   }
   config = {};
   assert.equal((await snapshot()).state.experimentalFreshConversationPerTurn, false);
+  assert.equal((await snapshot()).state.biggerContextAvailable, false);
+  config.solAvailable = true;
+  assert.equal((await snapshot()).state.biggerContextAvailable, true);
+  config.solAvailable = false;
+  assert.equal((await snapshot()).state.biggerContextAvailable, false);
 });
 
 test("browser preference controls are translated, disabled in Zero Risk, and invoke their settings", async () => {
@@ -565,6 +570,7 @@ test("browser preference controls are translated, disabled in Zero Risk, and inv
     api: {
       setFreshConversationPerTurn: async enabled => { invocation = enabled; return { experimentalFreshConversationPerTurn: enabled }; },
       setAutoApproveToolCalls: async enabled => { invocation = enabled; return { autoApproveToolCalls: enabled }; },
+      setBiggerContext: async enabled => { invocation = enabled; return { experimentalBiggerContext: enabled }; },
     },
     messageOf: String, platformLabel: String,
   };
@@ -578,22 +584,26 @@ test("browser preference controls are translated, disabled in Zero Risk, and inv
     for (const [property, label, body, unavailable] of [
       ["experimentalFreshConversationPerTurn", "freshConversation", "freshConversationBody", "manualFreshConversationUnavailable"],
       ["autoApproveToolCalls", "autoApproveTools", "autoApproveToolsBody", "manualAutoApproveUnavailable"],
+      ["experimentalBiggerContext", "biggerContext", "biggerContextBody", "manualBiggerContextUnavailable"],
     ]) {
       for (const key of [label, body, unavailable, "toolApprovalNeeded", "toolApprovalPendingBody"]) {
         assert.equal(typeof copy[key], "string");
         assert.ok(copy[key].length > 5);
       }
+      for (const available of property === "experimentalBiggerContext" ? [true, false] : [true])
       for (const [mode, configured, enabled] of [["automatic", true, false], ["automatic", true, true], ["manual", true, true], ["automatic", false, false]]) {
         const tree = render({ copy, devProfile: false, language, configureInteractionMode() {}, setError() {},
-          snapshot: { connectorNames: { automatic: "Codex Native2", manual: "Codex Zero Risk" }, state: { browserInteractionMode: mode, coreSetupComplete: configured, [property]: enabled } },
+          snapshot: { connectorNames: { automatic: "Codex Native2", manual: "Codex Zero Risk" }, state: { browserInteractionMode: mode, coreSetupComplete: configured, biggerContextAvailable: available, [property]: enabled } },
           updateState: value => { saved = value; },
         });
         const row = visit(tree).find(node => node.type === "SettingRow" && node.props.label === copy[label]);
         assert.ok(row);
-        assert.equal(row.props.body, mode === "manual" ? copy[unavailable] : copy[body]);
+        assert.equal(row.props.body, mode === "manual" ? copy[unavailable]
+          : property === "experimentalBiggerContext" && !available ? copy.lunaBiggerContextUnavailable : copy[body]);
         const control = visit(row).find(node => node.type === "Switch");
         assert.equal(control.props.checked, property === "autoApproveToolCalls" && mode === "manual" ? false : enabled);
-        assert.equal(control.props.disabled, mode === "manual" || !configured);
+        assert.equal(control.props.disabled, mode === "manual" || !configured
+          || (property === "experimentalBiggerContext" && !available && !enabled));
         if (!control.props.disabled) {
           control.props.onChange(!enabled);
           await new Promise(resolve => setImmediate(resolve));

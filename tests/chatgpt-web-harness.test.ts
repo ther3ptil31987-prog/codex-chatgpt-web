@@ -6,7 +6,7 @@ import { existsSync, mkdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { buildResponseJSON } from "../src/bridge";
-import { ChatGptWebAdapterError, chatGptStoppedThinkingError } from "../src/adapters/chatgpt-web/adapter-error";
+import { ChatGptWebAdapterError, chatGptStoppedThinkingError, chatGptResponseIncompleteError } from "../src/adapters/chatgpt-web/adapter-error";
 import { ChatGptCompletionTracker, chatGptImageFilePayloads, chatGptPromptFilePayloads, chatGptTurnIsComplete } from "../src/adapters/chatgpt-web/browser-worker";
 import { ChatGptBrowserWorker, type BrowserTurn } from "../src/adapters/chatgpt-web/browser-worker";
 import { chatGptConversationKey } from "../src/adapters/chatgpt-web/conversation-key";
@@ -1136,6 +1136,60 @@ describe("ChatGPT outer-native harness v4", () => {
     }
   });
 
+  test("a closed response writer detaches without cancelling accepted browser work", async () => {
+    for (const failureAt of ["text", "heartbeat"]) {
+      const provider: CodexProviderConfig = {
+        adapter: "chatgpt-web", baseUrl: `browser://writer-disconnect-${failureAt}-${Date.now()}`,
+        chatgptWeb: { localToolsEnabled: false, solAvailable: true, extraHighAvailable: true, proAvailable: true },
+      };
+      const worker = ChatGptBrowserWorker.forProvider(provider);
+      const originalRun = worker.run.bind(worker);
+      let browserStarts = 0;
+      let browserSignal: AbortSignal | undefined;
+      let finish!: () => void;
+      (worker as unknown as { run: (turn: BrowserTurn) => Promise<string> }).run = turn => {
+        browserStarts += 1;
+        browserSignal = turn.abortSignal;
+        turn.onSendActivated?.();
+        turn.onSubmitted?.();
+        if (failureAt === "text") turn.onTextDelta("First ");
+        return new Promise(resolve => { finish = () => {
+          turn.onTextDelta("complete");
+          resolve(failureAt === "text" ? "First complete" : "complete");
+        }; });
+      };
+      const request = rawWireRequest(environmentXml);
+      let heartbeats = 0;
+      try {
+        let failure: unknown;
+        try {
+          await createChatGptWebAdapter(provider).runTurn!(request, { headers: new Headers() }, event => {
+            if (event.type === "heartbeat") heartbeats += 1;
+            if ((failureAt === "text" && event.type === "text_delta" && event.phase === "final_answer")
+              || (failureAt === "heartbeat" && event.type === "heartbeat" && heartbeats > 1)) {
+              // Closed stream controllers throw even if no request AbortSignal has fired yet.
+              throw new TypeError("Controller is already closed");
+            }
+          });
+        } catch (error) { failure = error; }
+        expect(failure).toMatchObject({ name: "AbortError" });
+        expect(browserSignal?.aborted).toBeFalse();
+        const events: AdapterEvent[] = [];
+        const reconnect = createChatGptWebAdapter(provider).runTurn!(request, { headers: new Headers() }, event => events.push(event));
+        finish();
+        await reconnect;
+        finish = () => {};
+        expect(browserStarts).toBe(1);
+        expect(events.filter((event): event is Extract<AdapterEvent, { type: "text_delta" }> => event.type === "text_delta"
+          && event.phase === "final_answer").map(event => event.text).join(""))
+          .toBe(failureAt === "text" ? "First complete" : "complete");
+      } finally {
+        finish?.();
+        (worker as unknown as { run: (turn: BrowserTurn) => Promise<string> }).run = originalRun;
+      }
+    }
+  }, 20_000);
+
   test("an ambiguous submission outcome is stable across native reconnects", async () => {
     const provider: CodexProviderConfig = {
       adapter: "chatgpt-web",
@@ -1210,10 +1264,14 @@ describe("ChatGPT outer-native harness v4", () => {
     }
   });
 
-  test("Stopped thinking reaches the native response as a failed upstream turn without an automatic retry", async () => {
-    const socketPath = brokerTestEndpoint(`cgw-stopped-thinking-${process.pid}-${Date.now()}`);
+  test.each([
+    [chatGptStoppedThinkingError, "chatgpt_stopped_thinking", "usage limit may have been reached"],
+    [() => chatGptResponseIncompleteError("ChatGPT stopped showing generation or tool activity without a final answer."),
+      "chatgpt_response_incomplete", "without a final answer"],
+  ] as const)("browser failure preserves its exact explanation without an automatic retry (%s, %s)", async (failure, code, explanation) => {
+    const socketPath = brokerTestEndpoint(`cgw-${code}-${process.pid}-${Date.now()}`);
     const provider: CodexProviderConfig = {
-      adapter: "chatgpt-web", baseUrl: `browser://stopped-thinking-${Date.now()}`,
+      adapter: "chatgpt-web", baseUrl: `browser://${code}-${Date.now()}`,
       chatgptWeb: { brokerSocketPath: socketPath, localToolsEnabled: false, solAvailable: true, extraHighAvailable: true, proAvailable: true },
     };
     const worker = ChatGptBrowserWorker.forProvider(provider);
@@ -1222,17 +1280,17 @@ describe("ChatGPT outer-native harness v4", () => {
     worker.run = async turn => {
       browserStarts += 1;
       turn.onSendActivated?.();
-      throw chatGptStoppedThinkingError();
+      throw failure();
     };
     try {
       const events: AdapterEvent[] = [];
       await createChatGptWebAdapter(provider).runTurn!(rawWireRequest(environmentXml),
         { headers: new Headers() }, event => events.push(event));
-      expect(events.at(-1)).toMatchObject({ type: "error", code: "chatgpt_stopped_thinking", status: 502, retryable: false });
+      expect(events.at(-1)).toMatchObject({ type: "error", code, status: 502, retryable: false });
       const response = buildResponseJSON(events, CHATGPT_WEB_MODEL_ID);
       expect(response).toMatchObject({ status: "failed", retryable: false,
-        error: { type: "server_error", code: "chatgpt_stopped_thinking" } });
-      expect(JSON.stringify(response)).toContain("usage limit may have been reached");
+        error: { type: "server_error", code } });
+      expect(JSON.stringify(response)).toContain(explanation);
       expect(browserStarts).toBe(1);
       expect(events.some(event => event.type === "done")).toBeFalse();
     } finally {
@@ -2582,7 +2640,7 @@ describe("ChatGPT outer-native harness v4", () => {
     }
   });
 
-  test.each([false, true])("Pro keeps one MCP tool loop and replays results with fresh mode=%s", async freshConversation => {
+  test.each([false, true])("Pro keeps one MCP tool loop across writer failures with fresh mode=%s", async freshConversation => {
     const socketPath = brokerTestEndpoint(`cgw-h3-pro-${process.pid}-${Date.now()}`);
     const provider: CodexProviderConfig = {
       adapter: "chatgpt-web",
@@ -2594,6 +2652,7 @@ describe("ChatGPT outer-native harness v4", () => {
     const worker = ChatGptBrowserWorker.forProvider(provider);
     const originalRun = worker.run.bind(worker);
     let browserStarts = 0;
+    let nativeResults = 0;
     (worker as unknown as { run: (turn: BrowserTurn) => Promise<string> }).run = async turn => {
       browserStarts += 1;
       expect(turn.modelId).toBe(CHATGPT_WEB_MODEL_ID);
@@ -2615,6 +2674,7 @@ describe("ChatGPT outer-native harness v4", () => {
           arguments: { cmd: "pwd", workdir: tempRoot },
         }, 30_000));
         const output = (nativeResult.structuredContent as { output: string }).output;
+        nativeResults += 1;
         turn.onReasoningSummary?.("Pro received the native tool result");
         turn.onTextDelta("## Pro result");
         turn.onTextDelta(`\n\nWorkspace: ${output}`);
@@ -2628,6 +2688,9 @@ describe("ChatGPT outer-native harness v4", () => {
     const adapter = createChatGptWebAdapter(provider);
     const firstEvents: AdapterEvent[] = [];
     try {
+      await expect(adapter.runTurn!(request, { headers: new Headers() }, event => {
+        if (event.type === "tool_call_delta") throw new TypeError("tool response writer closed");
+      })).rejects.toMatchObject({ name: "AbortError" });
       await adapter.runTurn!(request, { headers: new Headers() }, event => firstEvents.push(event));
       expect(browserStarts).toBe(1);
       const call = firstEvents.find(
@@ -2673,8 +2736,12 @@ describe("ChatGPT outer-native harness v4", () => {
       );
 
       const finalEvents: AdapterEvent[] = [];
+      await expect(adapter.runTurn!(continuation, { headers: new Headers() }, event => {
+        if (event.type === "text_delta" && event.phase === "final_answer") throw new TypeError("final response writer closed");
+      })).rejects.toMatchObject({ name: "AbortError" });
       await adapter.runTurn!(continuation, { headers: new Headers() }, event => finalEvents.push(event));
       expect(browserStarts).toBe(1);
+      expect(nativeResults).toBe(1);
       expect(finalEvents.find(event => event.type === "thinking_delta")).toEqual({
         type: "thinking_delta",
         thinking: "Pro received the native tool result",

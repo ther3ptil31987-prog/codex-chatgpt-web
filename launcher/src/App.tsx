@@ -359,6 +359,7 @@ function LauncherShell({
   const [biggerContextRecommendationOpen, setBiggerContextRecommendationOpen] = useState(
     snapshot.state.browserInteractionMode === "automatic"
       && snapshot.state.coreSetupComplete === true
+      && snapshot.state.biggerContextAvailable === true
       && !snapshot.state.experimentalBiggerContext,
   );
   const [biggerContextRecommendationBusy, setBiggerContextRecommendationBusy] = useState(false);
@@ -381,10 +382,10 @@ function LauncherShell({
   const limitsCopy = limitsCopyFor(language);
 
   useEffect(() => {
-    if (snapshot.state.browserInteractionMode === "manual") {
+    if (snapshot.state.browserInteractionMode === "manual" || snapshot.state.biggerContextAvailable !== true) {
       setBiggerContextRecommendationOpen(false);
     }
-  }, [snapshot.state.browserInteractionMode]);
+  }, [snapshot.state.browserInteractionMode, snapshot.state.biggerContextAvailable]);
 
   useEffect(() => {
     if (!selectedManualTab) return;
@@ -1885,6 +1886,8 @@ function SettingsSurface({
         <SettingRow
           body={snapshot.state.browserInteractionMode === "manual"
             ? copy.manualBiggerContextUnavailable
+            : snapshot.state.biggerContextAvailable === false
+            ? copy.lunaBiggerContextUnavailable
             : copy.biggerContextBody}
           label={copy.biggerContext}
         >
@@ -1892,6 +1895,7 @@ function SettingsSurface({
             checked={snapshot.state.experimentalBiggerContext}
             disabled={busy
               || snapshot.state.browserInteractionMode === "manual"
+              || (snapshot.state.biggerContextAvailable !== true && !snapshot.state.experimentalBiggerContext)
               || snapshot.state.coreSetupComplete !== true}
             onChange={(checked) => void setBiggerContext(checked)}
           />
