@@ -596,6 +596,28 @@ test("chat preparation preserves page-read and composer errors instead of report
   }
 });
 
+test("cancelled chat preparation stops navigation and composer polling", async () => {
+  const worker = Object.create(ChatGptBrowserWorker.prototype) as any;
+  for (const stage of ["before-navigation", "navigation", "composer"]) {
+    const controller = new AbortController();
+    let navigations = 0;
+    let polls = 0;
+    const composers = {
+      filter() { return this; },
+      async count() { polls += 1; controller.abort(); return 0; },
+    };
+    const page = {
+      url: () => stage === "composer" ? "https://chatgpt.com/?temporary-chat=true" : "about:blank",
+      goto: () => { navigations += 1; controller.abort(); return new Promise(() => {}); },
+      locator: () => composers,
+    };
+    if (stage === "before-navigation") controller.abort();
+    await expect(worker.prepareChatSurface(page, undefined, false, controller.signal)).rejects.toThrow("aborted");
+    expect(navigations).toBe(stage === "navigation" ? 1 : 0);
+    expect(polls).toBe(stage === "composer" ? 1 : 0);
+  }
+});
+
 test("a stalled DOM observation fails within its probe budget", async () => {
   expect(CHATGPT_BROWSER_OBSERVATION_PROBE_TIMEOUT_MS).toBe(5_000);
   expect(MAX_CHATGPT_BROWSER_PAGE_REBINDS).toBe(2);
@@ -810,6 +832,29 @@ test("Bigger Context send activation keeps the outer stage budget instead of res
   )).resolves.toBe("user_turn");
   expect(pressOptions).toMatchObject({ noWaitAfter: true, timeout: 0 });
   expect(pressOptions?.signal).toBeInstanceOf(AbortSignal);
+});
+
+test("GPT-6 Sol rejects a staged prompt before opening a browser and releases its preparation", async () => {
+  const root = mkdtempSync(join(tmpdir(), "gpt6-standard-context-"));
+  const capabilities = { localToolsEnabled: false, solAvailable: true, extraHighAvailable: false, proAvailable: false };
+  let released = false;
+  let browserStages = 0;
+  const prepared = { ...compileChatGptWebPrompt({
+    modelId: CHATGPT_WEB_MODEL_ID, stream: true, options: { reasoning: "high" },
+    context: { messages: [{ role: "user", content: "Keep the entire task.", timestamp: 1 }] },
+  }, capabilities, undefined, { experimentalMultipartParts: 2 }), release() { released = true; } };
+  const worker: any = ChatGptBrowserWorker.forProvider({
+    adapter: "chatgpt-web", baseUrl: `browser://${root}`, chatgptWeb: { browserDiagnosticsPath: root },
+  });
+  worker.runStage = async () => { browserStages++; throw new Error("Browser must not be opened"); };
+  try {
+    await expect(worker.runBrowserTurn({
+      traceId: "six_standard", modelId: CHATGPT_WEB_MODEL_ID, modelFamily: "6", reasoning: "high", capabilities,
+      prepare: async () => prepared, onTextDelta() {}, onReasoningSummary() {},
+    })).rejects.toThrow("GPT-6 Sol uses standard context");
+    expect(browserStages).toBe(0);
+    expect(released).toBeTrue();
+  } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
 test("two-part saved chats re-prove unchanged effort after the first message creates the conversation URL", async () => {
@@ -2507,17 +2552,17 @@ function thinkSlashFixture() {
 }
 
 test("Think toggle preserves connectors and normal Luna clears it", async () => {
-  const { state, composerForm } = thinkSlashFixture();
+  const { state, composer } = thinkSlashFixture();
   state.connectors = ["Codex Native2"];
   const checkpoints: string[] = [];
 
-  await setChatGptThinkMode(composerForm as never, true, async checkpoint => { checkpoints.push(checkpoint); });
+  await setChatGptThinkMode(composer as never, true, async checkpoint => { checkpoints.push(checkpoint); });
   expect(state.pressed).toBeTrue();
   expect(state.commands).toEqual([]);
   expect(state.connectors).toEqual(["Codex Native2"]);
-  await setChatGptThinkMode(composerForm as never, true);
+  await setChatGptThinkMode(composer as never, true);
   expect(state.commands).toEqual([]);
-  await setChatGptThinkMode(composerForm as never, false, async checkpoint => { checkpoints.push(checkpoint); });
+  await setChatGptThinkMode(composer as never, false, async checkpoint => { checkpoints.push(checkpoint); });
   expect(state.pressed).toBeFalse();
   expect(state.commands).toEqual([]);
   expect(state.draft).toBe("");
@@ -2527,17 +2572,17 @@ test("Think toggle preserves connectors and normal Luna clears it", async () => 
 test("Think slash requires one command and verifies a newly exposed control", async () => {
   const ui = thinkSlashFixture();
   ui.state.controlPresent = false;
-  await setChatGptThinkMode(ui.composerForm as never, true);
+  await setChatGptThinkMode(ui.composer as never, true);
   expect(ui.state.pressed).toBeTrue();
   const ambiguous = thinkSlashFixture();
   ambiguous.state.controlPresent = false;
   ambiguous.state.optionCount = 2;
-  await expect(setChatGptThinkMode(ambiguous.composerForm as never, true)).rejects.toThrow("exactly one command option");
+  await expect(setChatGptThinkMode(ambiguous.composer as never, true)).rejects.toThrow("exactly one command option");
   expect(ambiguous.state.enters).toBe(0);
   const unavailable = thinkSlashFixture();
   unavailable.state.controlPresent = false;
   unavailable.state.optionCount = 0;
-  await expect(setChatGptThinkMode(unavailable.composerForm as never, true)).rejects.toThrow("Think command is unavailable");
+  await expect(setChatGptThinkMode(unavailable.composer as never, true)).rejects.toThrow("Think command is unavailable");
   expect(unavailable.state.enters).toBe(0);
 });
 
@@ -2545,7 +2590,7 @@ test("a failed Think toggle does not attempt a second action or alter the draft"
   const ui = thinkSlashFixture();
   ui.state.connectors = ["Codex Native2"];
   ui.control.click = async () => { throw new Error("Toggle failed"); };
-  await expect(setChatGptThinkMode(ui.composerForm as never, true)).rejects.toThrow("Toggle failed");
+  await expect(setChatGptThinkMode(ui.composer as never, true)).rejects.toThrow("Toggle failed");
   expect(ui.state.commands).toEqual([]);
   expect(ui.state.connectors).toEqual(["Codex Native2"]);
   expect(ui.state.draft).toBe("");
@@ -3383,7 +3428,7 @@ test("browser preflight separates model context from one-message transport limit
       "gpt-5.6-sol",
       effort,
       plus,
-      1_048_572,
+      500_000,
     )).not.toThrow();
     expect(() => assertChatGptWebInputWithinLimits(
       1,
@@ -3391,8 +3436,8 @@ test("browser preflight separates model context from one-message transport limit
       "gpt-5.6-sol",
       effort,
       plus,
-      1_048_573,
-    )).toThrow("1,048,572-character ChatGPT composer boundary");
+      500_001,
+    )).toThrow("500,000-character ChatGPT composer boundary");
   }
 
   expect(() => assertChatGptWebInputWithinLimits(
@@ -3436,6 +3481,33 @@ test("browser preflight separates model context from one-message transport limit
       75_000 + 8_192, 75_000, "gpt-5.6-sol", effort, pro, 520_000,
     )).toThrow("500,000-character ChatGPT composer boundary");
   }
+});
+
+test("GPT-6 staged input enforces its measured account and effort ceiling before submission", () => {
+  const pro = { localToolsEnabled: false, solAvailable: true, extraHighAvailable: true, proAvailable: true };
+  for (const effort of ["medium", "high", "xhigh"] as const) {
+    expect(() => assertChatGptWebMultipartInputWithinLimits(
+      239_999, 40_000, "gpt-5.6-sol", effort, pro, 200_000, 6, undefined, "6",
+    )).not.toThrow();
+    expect(() => assertChatGptWebMultipartInputWithinLimits(
+      240_000, 40_000, "gpt-5.6-sol", effort, pro, 200_000, 6, undefined, "6",
+    )).toThrow("240,000-token six-part ceiling");
+    expect(() => assertChatGptWebMultipartInputWithinLimits(
+      222_386, 40_000, "gpt-5.6-sol", effort, pro, 200_000, 2, undefined, "6",
+    )).toThrow("222,386-token two-part ceiling");
+    expect(() => assertChatGptWebMultipartInputWithinLimits(
+      100_000, 40_000, "gpt-5.6-sol", effort, { ...pro, proAvailable: false }, 200_000, 6, undefined, "6",
+    )).toThrow("GPT-6 Sol uses standard context");
+  }
+  expect(() => assertChatGptWebMultipartInputWithinLimits(
+    100_000, 40_000, "gpt-5.6-sol", "low", pro, 200_000, 6, undefined, "6",
+  )).toThrow("GPT-6 Sol uses standard context");
+  expect(() => assertChatGptWebMultipartInputWithinLimits(
+    333_578, 60_000, "gpt-5.6-sol", "high", pro, 250_000, 6, undefined, "5.6",
+  )).not.toThrow();
+  expect(() => assertChatGptWebMultipartInputWithinLimits(
+    336_578, 60_000, "gpt-5.6-sol", "max", pro, 250_000, 6, undefined, "6",
+  )).not.toThrow();
 });
 
 test("Bigger Context fits mixed-density whole records within both token and composer limits", () => {
@@ -3542,7 +3614,7 @@ test("Bigger Context preflight expands only the total context ceiling and keeps 
     "gpt-5.6-sol",
     "high",
     plus,
-    900_000,
+    500_000,
     6,
   )).not.toThrow();
   expect(() => assertChatGptWebMultipartInputWithinLimits(
@@ -3551,7 +3623,7 @@ test("Bigger Context preflight expands only the total context ceiling and keeps 
     "gpt-5.6-sol",
     "high",
     plus,
-    900_000,
+    500_000,
     6,
   )).toThrow("270,000-token six-part ceiling");
   expect(() => assertChatGptWebMultipartInputWithinLimits(
@@ -3560,7 +3632,7 @@ test("Bigger Context preflight expands only the total context ceiling and keeps 
     "gpt-5.6-sol",
     "high",
     plus,
-    900_000,
+    500_000,
     2,
   )).toThrow("180,000-token two-part ceiling");
   expect(() => assertChatGptWebMultipartInputWithinLimits(

@@ -257,6 +257,7 @@ function gatewayToolCatalogProgram(options: {
   offset: number;
   limit: number;
   excludedNames: string[];
+  marker: string;
 }): string {
   const needle = options.query?.trim().toLowerCase() ?? "";
   return [
@@ -271,14 +272,14 @@ function gatewayToolCatalogProgram(options: {
     "  .map(tool => ({ name: tool.name, description: typeof tool.description === \"string\" ? tool.description : \"\" }))",
     "  .filter(tool => !needle || (tool.name + \"\\n\" + tool.description).toLowerCase().includes(needle));",
     `const page = matches.slice(${options.offset}, ${options.offset + options.limit});`,
-    "text(JSON.stringify({ tools: page, total: matches.length }));",
+    `text(${JSON.stringify(options.marker)} + JSON.stringify({ tools: page, total: matches.length }));`,
   ].join("\n");
 }
 
 function gatewayToolCatalogPage(response: {
   content: unknown[];
   isError?: boolean;
-}, excludedNames: ReadonlySet<string>): GatewayToolCatalogPage {
+}, excludedNames: ReadonlySet<string>, marker: string): GatewayToolCatalogPage {
   const textBlocks = response.content
     .map(item => item && typeof item === "object" && !Array.isArray(item)
       ? item as Record<string, unknown>
@@ -288,12 +289,16 @@ function gatewayToolCatalogPage(response: {
   if (response.isError) {
     throw new Error(`Native nested tool inventory failed: ${textBlocks.join("\n") || "unknown error"}`);
   }
-  if (textBlocks.length !== 1) {
-    throw new Error("Native nested tool inventory returned an invalid text response");
+  // exec may wrap text() output with timing/status text. Only the single record
+  // emitted for this inventory request is a catalog, never arbitrary surrounding JSON.
+  const records = textBlocks.flatMap(text => text.split(/\r?\n/))
+    .filter(line => line.startsWith(marker));
+  if (records.length !== 1) {
+    throw new Error("Native nested tool inventory did not return one matching catalog record");
   }
   let parsed: unknown;
   try {
-    parsed = JSON.parse(textBlocks[0]!);
+    parsed = JSON.parse(records[0]!.slice(marker.length));
   } catch {
     throw new Error("Native nested tool inventory returned invalid JSON");
   }
@@ -814,6 +819,7 @@ export async function runChatGptMcpServer(options: {
         const gateway = execGateway(bound);
         if (gateway) {
           const excludedGatewayNames = bound.tools.map(wireName);
+          const marker = `codex-tool-catalog:${randomBytes(16).toString("hex")}:`;
           const nestedOffset = Math.max(0, offset - directMatches.length);
           const nestedLimit = Math.max(0, limit - directPage.length);
           const response = await invoke(claimed.bindingId, bound, gateway, {
@@ -825,9 +831,10 @@ export async function runChatGptMcpServer(options: {
               // duplicate or reopen an outer tool that this contract deliberately hid (including
               // our own MCP namespace in Zero Risk).
               excludedNames: excludedGatewayNames,
+              marker,
             }),
           }, extra.signal);
-          const catalog = gatewayToolCatalogPage(response, new Set(excludedGatewayNames));
+          const catalog = gatewayToolCatalogPage(response, new Set(excludedGatewayNames), marker);
           nestedTotal = catalog.total;
           nestedPage = catalog.tools.map(tool => ({
             wire_name: tool.name,

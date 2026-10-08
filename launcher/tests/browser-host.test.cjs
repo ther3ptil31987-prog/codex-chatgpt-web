@@ -645,6 +645,37 @@ test("hidden turn tabs receive an explicit renderer viewport before moving offsc
   assert.equal(tab.deviceEmulationDirty, false);
 });
 
+test("background tabs retain the measured browser pane size across selection and window visibility", () => {
+  const host = Object.assign(Object.create(BrowserHost.prototype), {
+    boundsReady: true,
+    bounds: { x: 280, y: 64, width: 710, height: 568 },
+    window: { getContentSize: () => [1120, 720] },
+  });
+  const hidden = host.hiddenTurnBounds();
+  assert.deepEqual(hidden, { x: 1121, y: 721, width: 710, height: 568 });
+  assert.ok(hidden.x > 1120 && hidden.y > 720, "the pane remains entirely offscreen");
+  const sizes = [];
+  const tab = {
+    status: "running", rendererReady: true, deviceEmulationDirty: true,
+    view: {
+      setBounds: ({ width, height }) => sizes.push([width, height]),
+      setVisible() {},
+      webContents: {
+        enableDeviceEmulation: ({ viewSize }) => sizes.push([viewSize.width, viewSize.height]),
+        disableDeviceEmulation() {},
+      },
+    },
+  };
+  host.presentTurnView(tab, false);
+  host.presentTurnView(tab, true);
+  host.presentTurnView(tab, false);
+  assert.ok(sizes.every(([width, height]) => width === 710 && height === 568));
+  // A real pane resize still updates every background renderer.
+  host.bounds = { ...host.bounds, width: 900, height: 640 };
+  host.presentTurnView(tab, false);
+  assert.deepEqual(tab.deviceEmulationViewport, { width: 900, height: 640 });
+});
+
 test("hidden primary checks retain a renderer viewport across resize and navigation, then restore native bounds", () => {
   const calls = [];
   let size = [1120, 720];
@@ -722,20 +753,20 @@ test("turn tabs use the hidden viewport when the launcher window is hidden", () 
   BrowserHost.prototype.syncViewVisibility.call(fixture);
 
   assert.deepEqual(events, [
-    ["home-bounds", { x: 1121, y: 721, width: 1120, height: 720 }],
+    ["home-bounds", { x: 1121, y: 721, width: 840, height: 656 }],
     ["home-visible", true],
     ["emulate", {
       screenPosition: "desktop",
-      screenSize: { width: 1120, height: 720 },
+      screenSize: { width: 840, height: 656 },
       viewPosition: { x: 0, y: 0 },
       deviceScaleFactor: 0,
-      viewSize: { width: 1120, height: 720 },
+      viewSize: { width: 840, height: 656 },
       scale: 1,
     }],
-    ["bounds", { x: 1121, y: 721, width: 1120, height: 720 }],
+    ["bounds", { x: 1121, y: 721, width: 840, height: 656 }],
     ["visible", true],
   ]);
-  assert.deepEqual(tab.deviceEmulationViewport, { width: 1120, height: 720 });
+  assert.deepEqual(tab.deviceEmulationViewport, { width: 840, height: 656 });
 });
 
 test("new turn tabs defer device emulation until their renderer finishes loading", () => {
@@ -773,14 +804,14 @@ test("new turn tabs defer device emulation until their renderer finishes loading
   assert.equal(tab.deviceEmulationDirty, true);
 });
 
-test("visible turn tabs establish native bounds before clearing background emulation", () => {
+test("visible turn tabs keep the explicit viewport across background transitions", () => {
   const events = [];
   const tab = {
     id: "tab-visible-viewport",
     status: "running",
     rendererReady: true,
-    deviceEmulationViewport: { width: 1120, height: 720 },
-    deviceEmulationDirty: true,
+    deviceEmulationViewport: { width: 840, height: 656 },
+    deviceEmulationDirty: false,
     view: {
       setBounds: bounds => events.push(["bounds", bounds]),
       setVisible: visible => events.push(["visible", visible]),
@@ -812,13 +843,12 @@ test("visible turn tabs establish native bounds before clearing background emula
   BrowserHost.prototype.syncViewVisibility.call(fixture);
 
   assert.deepEqual(events, [
-    ["home-bounds", { x: 1121, y: 721, width: 1120, height: 720 }],
+    ["home-bounds", { x: 1121, y: 721, width: 840, height: 656 }],
     ["home-visible", true],
     ["bounds", { x: 280, y: 64, width: 840, height: 656 }],
-    ["disable-emulation"],
     ["visible", true],
   ]);
-  assert.equal(tab.deviceEmulationViewport, null);
+  assert.deepEqual(tab.deviceEmulationViewport, { width: 840, height: 656 });
   assert.equal(tab.deviceEmulationDirty, false);
 });
 
@@ -2032,7 +2062,7 @@ test("a viewport-refresh heartbeat reapplies hidden emulation before CDP reconne
     status: "running",
     lastHeartbeatAt: 1,
     rendererReady: true,
-    deviceEmulationViewport: { width: 1120, height: 720 },
+    deviceEmulationViewport: { width: 840, height: 656 },
     deviceEmulationDirty: false,
     view: {
       setBounds: bounds => events.push(["bounds", bounds]),
@@ -2067,7 +2097,7 @@ test("a viewport-refresh heartbeat reapplies hidden emulation before CDP reconne
   BrowserHost.prototype.heartbeatTurn.call(fixture, tab.traceId, tab.helperPid, true);
 
   assert.equal(events.filter(([kind]) => kind === "emulate").length, 1);
-  assert.deepEqual(tab.deviceEmulationViewport, { width: 1120, height: 720 });
+  assert.deepEqual(tab.deviceEmulationViewport, { width: 840, height: 656 });
   assert.equal(tab.deviceEmulationDirty, false);
 });
 
@@ -2352,6 +2382,39 @@ test("concurrent launcher session refresh requests share one browser operation",
   finishProbe({ authenticated: true });
   await first;
   assert.equal(fixture.sessionRefreshOperation, null);
+});
+
+test("startup sign-in redirects become signed-out state while real navigation errors remain errors", async () => {
+  for (const redirected of [true, false]) {
+    let url = IDLE_BROWSER_URL;
+    const failure = Object.assign(new Error("navigation stopped"), { code: -3 });
+    const fixture = Object.assign(Object.create(BrowserHost.prototype), {
+      state: { authenticated: true },
+      snapshot() { return { ...this.state }; },
+      setState(patch) { Object.assign(this.state, patch); },
+      withManualOperation: async (_name, action) => await action(),
+      view: { webContents: {
+        isDestroyed: () => false,
+        getURL: () => url,
+        loadURL: async () => {
+          if (redirected) url = "https://chatgpt.com/auth/login?next=%2F";
+          throw failure;
+        },
+        executeJavaScript: async () => { throw new Error("must not probe a login page"); },
+      } },
+    });
+    if (redirected) {
+      const state = await fixture.refreshAuthentication();
+      assert.equal(state.status, "signed-out");
+      assert.equal(state.authenticated, false);
+      assert.equal(state.message, "Sign in to ChatGPT");
+    } else {
+      await assert.rejects(fixture.refreshAuthentication(), error => error === failure);
+      assert.equal(fixture.state.status, "error");
+      assert.equal(fixture.state.loading, false);
+    }
+    assert.equal(fixture.sessionRefreshOperation, null);
+  }
 });
 
 test("manual browser operations disable background throttling until completion", async () => {
@@ -3453,7 +3516,7 @@ test("manual hidden tabs use native view placement without DOM or device-emulati
   const fixture = Object.assign(Object.create(BrowserHost.prototype), {
     bounds: { x: 1, y: 2, width: 640, height: 480 },
     hiddenTurnBounds: () => ({ x: 1000, y: 1000, width: 800, height: 600 }),
-    enableHiddenTurnViewport: () => { throw new Error("manual tabs must not enable device emulation"); },
+    enableBrowserViewport: () => { throw new Error("manual tabs must not enable device emulation"); },
   });
   const tab = {
     interactionMode: "manual",

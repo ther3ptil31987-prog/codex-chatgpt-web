@@ -393,7 +393,6 @@ test("launcher update transaction upgrades its owned full runtime with saved con
     "--browser-host-descriptor",
     "/runtime/launcher-browser.json",
     "--automatic-browser-interaction",
-    "--refresh-account-capabilities",
     "--acknowledge-unofficial",
     "--restart-service",
   ]);
@@ -405,6 +404,48 @@ test("launcher update transaction upgrades its owned full runtime with saved con
     connectorMigrated: false,
     stdout: "",
   });
+});
+
+test("a failed version upgrade preserves setup inputs without starting an incompatible old runtime", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-web-gpt-upgrade-failure-"));
+  const configPath = path.join(root, "config.json");
+  const config = { mode: "browser-only", browserHost: "launcher", releaseVersion: "6.1.4" };
+  fs.writeFileSync(configPath, `${JSON.stringify(config)}\n`);
+  let stops = 0;
+  let starts = 0;
+  const host = new RuntimeHost({
+    app: { getPath: () => root, getVersion: () => "6.1.6" },
+    logger: { info() {}, warn() {}, error() {} },
+    sourceRoot: "/source",
+    browserDescriptorPath: path.join(root, "launcher-browser.json"),
+    codexHome: path.join(root, "codex"),
+    supervisor: {
+      configPath,
+      readSetupConfig: () => JSON.parse(fs.readFileSync(configPath)),
+      readConfig: () => JSON.parse(fs.readFileSync(configPath)),
+      stopForSetup: async () => { stops += 1; },
+      startIfConfigured: async () => { starts += 1; return { status: "needs-setup" }; },
+    },
+  });
+  host.run = async (_name, args) => {
+    assert.equal(args.includes("--refresh-account-capabilities"), false);
+    if (args.includes("--preflight-only")) return { code: 0, stdout: "", stderr: "" };
+    fs.writeFileSync(configPath, `${JSON.stringify({ ...config, releaseVersion: "6.1.6" })}\n`);
+    throw new Error("configuration write failed");
+  };
+  try {
+    await assert.rejects(host.upgradeManagedRuntime(), error => {
+      assert.match(error.message, /configuration write failed/);
+      assert.match(error.message, /Restart the launcher to retry the update/);
+      assert.doesNotMatch(error.message, /Previous runtime recovery|expected ready/);
+      return true;
+    });
+    assert.deepEqual(JSON.parse(fs.readFileSync(configPath)), config);
+    assert.equal(stops, 1);
+    assert.equal(starts, 0);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
 });
 
 test("launcher migrates the legacy connector identity even when the release version is unchanged", async () => {
@@ -424,7 +465,6 @@ test("launcher migrates the legacy connector identity even when the release vers
     "--browser-host-descriptor",
     "/runtime/launcher-browser.json",
     "--automatic-browser-interaction",
-    "--refresh-account-capabilities",
     "--acknowledge-unofficial",
     "--restart-service",
   ]);
@@ -445,7 +485,7 @@ test("launcher update transaction does not preserve a stale disconnected route p
   assert.equal(result.updated, true);
   assert.equal("bridgeEnabled" in result, false);
   assert.equal(fixture.invocation().args.includes("disconnect"), false);
-  assert.equal(fixture.invocation().args.includes("--refresh-account-capabilities"), true);
+  assert.equal(fixture.invocation().args.includes("--refresh-account-capabilities"), false);
 });
 
 test("launcher update preserves Zero Risk and never probes its account capabilities", async () => {

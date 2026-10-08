@@ -4,6 +4,8 @@ const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
 const { spawnSync } = require("node:child_process");
+const { EventEmitter } = require("node:events");
+const { PassThrough } = require("node:stream");
 const {
   buildJob,
   compareVersions,
@@ -309,39 +311,70 @@ test("detached worker replaces an installed Linux AppImage and removes the old v
 });
 
 
-test("update downloads use the supplied Chromium transport across HTTPS redirects without cookies", async () => {
-  const calls = [];
-  const downloader = createUpdateDownloader(async (url, options) => {
-    calls.push({ url, options });
-    return calls.length === 1
-      ? new Response(null, { status: 302, headers: { location: "https://release-assets.githubusercontent.com/asset" } })
-      : new Response("release metadata");
-  });
+// Electron emits redirects before the response and requires synchronous approval.
+function updateTransport({ redirects = [], body = "release metadata", status = 200, stall, error } = {}) {
+  const requests = [];
+  const createRequest = options => {
+    const request = new EventEmitter();
+    requests.push(request);
+    request.options = options;
+    request.followed = [];
+    request.aborted = false;
+    request.abort = () => {
+      if (request.aborted) return;
+      request.aborted = true;
+      request.response?.emit("aborted");
+      request.emit("abort");
+    };
+    request.end = () => queueMicrotask(() => {
+      for (const destination of redirects) {
+        let followed = false;
+        request.followRedirect = () => { followed = true; request.followed.push(destination); };
+        request.emit("redirect", 302, "GET", destination, {});
+        if (request.aborted) return;
+        if (!followed) { request.emit("error", new Error("Redirect was cancelled")); return; }
+      }
+      if (stall === "headers") return;
+      const response = request.response = new PassThrough();
+      response.statusCode = status;
+      request.emit("response", response);
+      response.write(Buffer.from(body));
+      if (error) request.emit("error", error);
+      else if (stall !== "body") response.end();
+    });
+    return request;
+  };
+  return { createRequest, requests };
+}
+
+test("update downloads follow Chromium redirects synchronously without cookies", async () => {
+  const transport = updateTransport({ redirects: ["https://release-assets.githubusercontent.com/asset"] });
+  const downloader = createUpdateDownloader(transport.createRequest);
   assert.equal(await downloader.downloadText("https://github.com/release"), "release metadata");
-  assert.deepEqual(calls.map(call => call.url), [
-    "https://github.com/release", "https://release-assets.githubusercontent.com/asset",
-  ]);
-  for (const { options } of calls) {
+  assert.equal(transport.requests.length, 1);
+  assert.deepEqual(transport.requests[0].followed, ["https://release-assets.githubusercontent.com/asset"]);
+  for (const { options, aborted } of transport.requests) {
     assert.equal(options.credentials, "omit");
     assert.equal(options.redirect, "manual");
     assert.equal(options.cache, "no-store");
-    assert.equal(options.signal.aborted, true);
+    assert.equal(aborted, true);
   }
 });
 
 test("update downloads reject redirect downgrades, redirect loops and oversized metadata", async () => {
-  let requests = 0;
-  const downgrade = createUpdateDownloader(async () => {
-    requests += 1;
-    return new Response(null, { status: 302, headers: { location: "http://example.com/asset" } });
-  });
-  await assert.rejects(downgrade.downloadText("https://github.com/release"), /Refusing non-HTTPS/);
-  assert.equal(requests, 1);
-  const loop = createUpdateDownloader(async () => new Response(null, {
-    status: 302, headers: { location: "/again" },
-  }));
-  await assert.rejects(loop.downloadText("https://github.com/release"), /Too many redirects/);
-  const oversized = createUpdateDownloader(async () => new Response("12345"));
+  for (const url of ["http://example.com/asset", "https://user:secret@example.com/asset"]) {
+    const transport = updateTransport({ redirects: [url] });
+    const downloader = createUpdateDownloader(transport.createRequest);
+    await assert.rejects(downloader.downloadText("https://github.com/release"), /Refusing non-HTTPS/);
+    assert.deepEqual(transport.requests[0].followed, []);
+    assert.equal(transport.requests[0].aborted, true);
+    await assert.rejects(downloader.downloadText(url), /Refusing non-HTTPS/);
+    assert.equal(transport.requests.length, 1);
+  }
+  const loop = updateTransport({ redirects: Array(6).fill("https://github.com/again") });
+  await assert.rejects(createUpdateDownloader(loop.createRequest).downloadText("https://github.com/release"), /Too many redirects/);
+  assert.equal(loop.requests[0].followed.length, 5);
+  const oversized = createUpdateDownloader(updateTransport({ body: "12345" }).createRequest);
   await assert.rejects(oversized.downloadText("https://github.com/release", 4), /size limit/);
 });
 
@@ -349,19 +382,24 @@ test("update downloads cancel stalled headers and stalled response bodies", asyn
   // Keep the event loop alive while testing the deliberately unref'ed production timer.
   const keepAlive = setInterval(() => {}, 1000);
   try {
-    const headers = createUpdateDownloader((_url, { signal }) => new Promise((_resolve, reject) => {
-      signal.addEventListener("abort", () => reject(signal.reason), { once: true });
-    }), 15);
-    await assert.rejects(headers.downloadText("https://github.com/release"), /timed out/);
-    const body = createUpdateDownloader(async (_url, { signal }) => new Response(new ReadableStream({
-      start(controller) {
-        controller.enqueue(Buffer.from("partial"));
-        signal.addEventListener("abort", () => controller.error(signal.reason), { once: true });
-      },
-    })), 15);
-    await assert.rejects(body.downloadText("https://github.com/release"), /timed out/);
+    for (const stall of ["headers", "body"]) {
+      const transport = updateTransport({ stall });
+      await assert.rejects(createUpdateDownloader(transport.createRequest, 15).downloadText("https://github.com/release"), /timed out/);
+      assert.equal(transport.requests[0].aborted, true);
+    }
   } finally {
     clearInterval(keepAlive);
+  }
+});
+
+test("update downloads reject HTTP errors and interrupted response streams", async () => {
+  for (const [options, message] of [
+    [{ status: 404 }, /HTTP 404/],
+    [{ error: new Error("connection lost") }, /connection lost/],
+  ]) {
+    const transport = updateTransport(options);
+    await assert.rejects(createUpdateDownloader(transport.createRequest).downloadText("https://github.com/release"), message);
+    assert.equal(transport.requests[0].aborted, true);
   }
 });
 
@@ -369,7 +407,7 @@ test("update asset streaming preserves bytes and refuses to overwrite a file", a
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-update-download-"));
   const destination = path.join(root, "asset.zip");
   const bytes = Buffer.from([0, 1, 2, 127, 128, 255]);
-  const downloader = createUpdateDownloader(async () => new Response(bytes));
+  const downloader = createUpdateDownloader(updateTransport({ body: bytes }).createRequest);
   try {
     await downloader.downloadFile("https://github.com/release", destination);
     assert.deepEqual(fs.readFileSync(destination), bytes);

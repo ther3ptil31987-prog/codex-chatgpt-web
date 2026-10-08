@@ -3,7 +3,7 @@ import { readFileSync } from "node:fs";
 import { createContext, runInContext } from "node:vm";
 import type { Locator } from "playwright-core";
 import { ChatGptBrowserWorker, ChatGptCompletionTracker, ChatGptVisibleTraceTracker, CHATGPT_COMPLETION_SETTLE_MS } from "../src/adapters/chatgpt-web/browser-worker";
-import { ChatGptMarkdownBuffer, type ChatGptMarkdownSegment } from "../src/adapters/chatgpt-web/markdown";
+import { ChatGptMarkdownBuffer, ChatGptMarkdownConsistencyError, type ChatGptMarkdownSegment } from "../src/adapters/chatgpt-web/markdown";
 
 const smokeHtml = readFileSync(new URL("./fixtures/chatgpt-dil-smoke.html", import.meta.url), "utf8");
 const powerCompleteHtml = readFileSync(new URL("./fixtures/chatgpt-power-complete.html", import.meta.url), "utf8");
@@ -23,6 +23,10 @@ type Snapshot = {
 
 // Execute the production page callback, with only missing Domino browser APIs supplied.
 async function snapshot(html: string): Promise<Snapshot> {
+  return (await snapshots(html, []))[0]!;
+}
+
+async function snapshots(html: string, changes: Array<(document: Document) => void>): Promise<Snapshot[]> {
   const { createWindow } = require("@mixmark-io/domino");
   const window = createWindow(html);
   const innerText = Object.getOwnPropertyDescriptor(window.HTMLElement.prototype, "innerText");
@@ -58,7 +62,11 @@ async function snapshot(html: string): Promise<Snapshot> {
     const worker = Object.create(ChatGptBrowserWorker.prototype) as {
       responseDomSnapshot(locator: Locator): Promise<Snapshot>;
     };
-    const result = await worker.responseDomSnapshot(locator);
+    const result = [await worker.responseDomSnapshot(locator)];
+    for (const change of changes) {
+      change(window.document);
+      result.push(await worker.responseDomSnapshot(locator));
+    }
     expect(errors).toEqual([]);
     return result;
   } finally {
@@ -151,12 +159,46 @@ test("observed resource preview hydration cannot rewrite delivered answer text",
     expect(buffer.observe(before.markdownSegments, 0)).toBe("The layout was updated.");
     expect(buffer.observe(after.markdownSegments, 1)).toBe("");
     expect(buffer.finish().markdown).toBe("The layout was updated.\n\nValidation completed.");
-    expect(before.markdownSegments).toEqual(after.markdownSegments);
+    // These snapshots use different documents; node identities must not be reused.
+    expect(before.markdownSegments.map(({ key, ...content }) => content))
+      .toEqual(after.markdownSegments.map(({ key, ...content }) => content));
     expect(after.markdownSegments.map(segment => segment.html).join("")).not.toContain("candidate-overview.png");
     expect(after.fullHtml).toContain("candidate-overview.png"); // The browser's original content is untouched.
 
     buffer.observe((await snapshot(page("Layout", "").replace("The layout was updated.", "Changed answer."))).markdownSegments, 2);
-    expect(() => buffer.finish()).toThrow("changed a completed text block");
+    expect(() => buffer.finish()).toThrow(ChatGptMarkdownConsistencyError);
+  }
+});
+
+test("file preview removal preserves a pending paragraph through movement and remounting", async () => {
+  for (const remount of [false, true]) {
+    const html = `<div id="turn"><div class="markdown">
+      <p>Report saved:</p><p id="file">report.md</p><p id="tail">Validation completed.</p>
+    </div><button aria-label="Copy"></button></div>`;
+    const [before, moved, repeated, continued, changed] = await snapshots(html, [
+      document => {
+        const root = document.querySelector(".markdown")!;
+        const file = document.querySelector("#file")!;
+        root.parentElement!.appendChild(file);
+        if (remount) root.innerHTML = root.innerHTML;
+      },
+      () => {},
+      document => {
+        const next = document.createElement("p");
+        next.textContent = "The task is finished.";
+        document.querySelector(".markdown")!.appendChild(next);
+      },
+      document => { document.querySelector(".markdown p")!.textContent = "A changed report."; },
+    ]);
+    const buffer = new ChatGptMarkdownBuffer(undefined, 0);
+    expect(buffer.observe(before!.markdownSegments, 0)).toBe("Report saved:\n\nreport.md");
+    expect(buffer.observe(moved!.markdownSegments, 1)).toBe("");
+    expect(buffer.observe(repeated!.markdownSegments, 2)).toBe("");
+    if (!remount) expect(moved!.markdownSegments.at(-1)!.key).toBe(before!.markdownSegments.at(-1)!.key);
+    expect(buffer.observe(continued!.markdownSegments, 3)).toBe("\n\nValidation completed.");
+    expect(buffer.finish().markdown).toBe("Report saved:\n\nreport.md\n\nValidation completed.\n\nThe task is finished.");
+    buffer.observe(changed!.markdownSegments, 4);
+    expect(() => buffer.finish()).toThrow(ChatGptMarkdownConsistencyError);
   }
 });
 
@@ -355,5 +397,5 @@ test("KaTeX hydration keeps the same formula identity while real formula edits s
   buffer.observe(hydrated.markdownSegments, 1);
   expect(buffer.finish().markdown).toBe(String.raw`Value \(x_1\).` + "\n\nDone.");
   buffer.observe((await snapshot(html("x2", "x_2"))).markdownSegments, 2);
-  expect(() => buffer.finish()).toThrow("changed a completed text block");
+  expect(() => buffer.finish()).toThrow(ChatGptMarkdownConsistencyError);
 });

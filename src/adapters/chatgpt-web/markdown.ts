@@ -389,7 +389,9 @@ export class ChatGptMarkdownBuffer {
       }
 
       const followsVisibleCommittedTail = highestCommittedIndex === this.committed.length - 1;
-      if (!followsVisibleCommittedTail && !this.matchesLatestPending(segment)) {
+      // A known, undelivered paragraph also anchors new content after a virtualized
+      // committed tail. Earlier committed blocks are still checked above for edits/reordering.
+      if (!followsVisibleCommittedTail && !sawPending && !this.matchesLatestPending(segment)) {
         return new ChatGptMarkdownConsistencyError(
           "ChatGPT final DOM could not be aligned with text already streamed to Codex",
         );

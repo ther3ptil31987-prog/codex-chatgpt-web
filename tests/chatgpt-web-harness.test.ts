@@ -2952,6 +2952,7 @@ describe("ChatGPT outer-native harness v4", () => {
         query: string,
         includeSchema: boolean,
         nestedToolNames: string[],
+        format: (content: Array<{ type: string; text?: string }>) => Array<{ type: string; text?: string }> = content => content,
       ) => {
         const pending = call("codex_tool_inventory", {
           turn_token: token,
@@ -2963,9 +2964,33 @@ describe("ChatGPT outer-native harness v4", () => {
         const gatewayCalls: GatewayProgramCall[] = [];
         const content = await executeGatewayProgram(request!.input!, nestedToolNames, gatewayCalls);
         expect(gatewayCalls).toEqual([]);
-        broker.completeTool(token, request!.callId, { content });
+        broker.completeTool(token, request!.callId, { content: format(content) as typeof content });
         return await pending;
       };
+
+      let previousCatalog: Array<{ type: string; text?: string }> = [];
+      const wrappedInventory = await inventoryThroughGateway("web__run", true, ["web__run"], content => {
+        previousCatalog = content;
+        return [{ type: "text", text: "Script completed\nWall time: 0.01s\nOutput:\n" + content[0]!.text }];
+      });
+      expect(wrappedInventory.structuredContent).toMatchObject({
+        total: 1, tools: [{ wire_name: "web__run", description: "web__run test tool" }],
+      });
+      for (const format of [
+        () => previousCatalog,
+        (content: typeof previousCatalog) => [...content, ...content],
+        () => [{ type: "text", text: JSON.stringify({ tools: [], total: 0 }) }],
+        (content: typeof previousCatalog) => [{ type: "text", text: content[0]!.text!.replace('{"tools":', '{invalid:') }],
+      ]) {
+        const rejected = await inventoryThroughGateway("web__run", true, ["web__run"], format);
+        expect(rejected.isError).toBe(true);
+        expect(rejected.structuredContent).toBeUndefined();
+      }
+      const splitInventory = await inventoryThroughGateway("web__run", true, ["web__run"], content => [
+        { type: "text", text: "Script completed\nOutput:\n{}" }, ...content,
+        { type: "text", text: "Wall time: 0.01s" },
+      ]);
+      expect(splitInventory.structuredContent).toMatchObject({ total: 1, tools: [{ wire_name: "web__run" }] });
 
       // Even an empty inventory query crosses the broker through the native exec gateway. The
       // browser therefore observes a real tool boundary before the model plans its next call.

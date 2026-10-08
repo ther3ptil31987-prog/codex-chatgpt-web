@@ -15,7 +15,7 @@ function familyOption(menu: EffortMenu, family: ChatGptWebModelFamily) {
   return menu.menu.getByRole("menuitemradio", {
     name: family === "5.6" ? /^GPT[-\s]?5\.6\s+Sol(?:\s+Pro)?$/i
       // Simplified/Traditional Chinese and Japanese share 最新; Korean uses 최신.
-      : /^(?:Latest|最新|최신|GPT[-\s]?6(?:\s+Astra)?(?:\s+Pro)?)$/i,
+      : /^(?:Latest|最新|최신|(?:GPT[-\s]?)?6(?:\s+Astra)?(?:\s+Pro)?)$/i,
     exact: true,
     includeHidden: true,
   });
@@ -36,7 +36,8 @@ export async function selectChatGptModelFamily(
     if (await powerView.count() === 1) {
       const view = await powerView.getAttribute("data-model-picker-view");
       if (view === "simple") {
-        const trigger = powerView.locator('[data-model-picker-view-toggle="true"][aria-hidden="false"]');
+        const trigger = powerView.locator('[data-model-picker-view-toggle="true"]:not([aria-hidden="true"])')
+          .filter({ visible: true });
         if (await trigger.count() !== 1) throw familyError(family);
         await trigger.click({ timeout: 5_000 });
       } else if (view !== "advanced") throw familyError(family);
@@ -70,16 +71,16 @@ export function chatGptModelFamilyMatches(
   family: ChatGptWebModelFamily,
   effort: ChatGptWebAdapterEffort,
 ): boolean {
-  // Latest uses 5.6 for the existing lower-effort multipart acknowledgements and 6 for Pro.
-  // Never interpret a future Latest Pro model as 6, or a lower effort as the final Pro response.
-  const expected = family === "6" && effort !== "max" ? "5.6" : family;
+  // GPT-6 uses Sol below Pro and Astra at Pro. An old Latest picker can still use
+  // 5.6 at lower efforts; that is not proof of an explicitly requested GPT-6 turn.
+  const expectedName = family === "6" && effort === "max" ? "astra" : "sol";
   const states = descriptions.flatMap(text => {
     const match = /^(?:GPT[-\s]?)?(\d+(?:\.\d+)?)(?:\s+(Sol|Astra))?\s+([^,，]+)(?:[,，]|$)/i
       .exec(text.replace(/\s+/g, " ").trim());
     return match ? [{ version: match[1], name: match[2]?.toLowerCase(), mode: match[3]!.trim() }] : [];
   });
-  return states.length > 0 && states.every(state => state.version === expected
-    && (!state.name || state.name === (expected === "5.6" ? "sol" : "astra"))
+  return states.length > 0 && states.every(state => state.version === family
+    && (!state.name || state.name === expectedName)
     && (effort === "max" ? /^Pro$/i.test(state.mode) : !/^Pro$/i.test(state.mode)));
 }
 

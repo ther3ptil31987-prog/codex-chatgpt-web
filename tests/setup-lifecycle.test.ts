@@ -56,6 +56,53 @@ test("launcher setup refreshes account capabilities only when missing or explici
   } as never, false, "automatic")).toBe(true);
 });
 
+for (const development of [false, true]) {
+  test(`${development ? "DEV" : "production"} updates an installed launcher without a ChatGPT session`, async () => {
+    const root = mkdtempSync(join(tmpdir(), "codex-web-offline-upgrade-"));
+    const configPath = join(root, "config.json");
+    const existing = {
+      ...configModule.defaultConfig("browser-only"),
+      releaseVersion: "6.1.4",
+      browserHost: "launcher" as const,
+      solAvailable: true, extraHighAvailable: true, proAvailable: true,
+      ...(development ? { purpose: "dev-harness" as const } : {}),
+    };
+    writeFileSync(configPath, JSON.stringify(existing));
+    const save = spyOn(configModule, "saveConfig").mockImplementation(() => {});
+    const inspect = spyOn(browserHost, "inspectLauncherBrowserHost").mockRejectedValue(new Error("ChatGPT is signed out"));
+    const mocks = [save, inspect,
+      spyOn(configModule, "getConfigPath").mockReturnValue(configPath),
+      spyOn(configModule, "loadConfigForSetup").mockImplementation(() => structuredClone(existing)),
+      spyOn(integration, "preflightCodexIntegration").mockImplementation(() => {}),
+      spyOn(integration, "installCodexIntegration").mockImplementation(() => ({} as never)),
+      spyOn(service, "getServiceStatus").mockReturnValue({ installed: false, loaded: false } as never),
+      spyOn(service, "removeLegacyRuntimeArtifacts").mockImplementation(() => {}),
+    ];
+    try {
+      const listener = Bun.serve({ port: 0, hostname: "127.0.0.1", fetch: () => new Response() });
+      const port = listener.port!;
+      await listener.stop(true);
+      const options = { mode: "browser-only" as const, subagentProtocol: "native" as const, port,
+        browserHostDescriptorPath: join(root, "launcher-browser.json"), acknowledgedUnofficial: true };
+      const configure = development ? setupDevProfile : setup;
+      await configure(options);
+      expect(inspect).not.toHaveBeenCalled();
+      expect(save).toHaveBeenCalledTimes(1);
+      expect(save.mock.calls[0]![0]).toMatchObject({
+        releaseVersion: configModule.defaultConfig().releaseVersion,
+        solAvailable: true, extraHighAvailable: true, proAvailable: true,
+      });
+      // Refreshing the actual model list still requires evidence from the account.
+      await expect(configure({ ...options, refreshAccountCapabilities: true })).rejects.toThrow("ChatGPT is signed out");
+      expect(inspect).toHaveBeenCalledTimes(1);
+      expect(save).toHaveBeenCalledTimes(1);
+    } finally {
+      for (const mock of mocks.reverse()) mock.mockRestore();
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+}
+
 for (const development of [false, true]) for (const interaction of ["manual", "automatic"] as const) {
   test(`${development ? "DEV" : "production"} ${interaction} setup commits the tunnel inputs before its supervisor starts the runtime`, async () => {
     const root = mkdtempSync(join(tmpdir(), "codex-web-setup-owner-"));

@@ -601,7 +601,10 @@ export class DevChatDriver {
       extraHighAvailable: this.config.extraHighAvailable === true,
       proAvailable: this.config.proAvailable,
     });
-    const limits = resolveChatGptWebContextLimits(route.backendModel, route.adapterEffort, this.config);
+    const limits = resolveChatGptWebContextLimits(
+      route.backendModel, route.adapterEffort, this.config,
+      route.interactionMode === "automatic" ? route.modelFamily : undefined,
+    );
     const autoCompactTokenLimit = limits.autoCompactTokenLimit;
     const contextWindow = limits.contextWindow;
     return {

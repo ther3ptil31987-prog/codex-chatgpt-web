@@ -339,14 +339,23 @@ async function inspectLauncherCapabilities(
     refreshAccountCapabilities,
     config.browserInteractionMode,
   );
+  if (!detectCapabilities) {
+    // Updating the local runtime or its settings does not require a live web session.
+    // Only initial setup and an explicit model refresh inspect the account.
+    return {
+      solAvailable: existing!.solAvailable,
+      extraHighAvailable: existing!.extraHighAvailable === true,
+      proAvailable: existing!.proAvailable,
+    };
+  }
   const inspected = await inspectLauncherBrowserHost(config.browserHostDescriptorPath!, {
-    detectCapabilities,
+    detectCapabilities: true,
     expectedProfile,
   });
   return {
-    solAvailable: detectCapabilities ? inspected.solAvailable === true : existing!.solAvailable,
-    extraHighAvailable: detectCapabilities ? inspected.extraHighAvailable === true : existing!.extraHighAvailable === true,
-    proAvailable: detectCapabilities ? inspected.proAvailable === true : existing!.proAvailable,
+    solAvailable: inspected.solAvailable === true,
+    extraHighAvailable: inspected.extraHighAvailable === true,
+    proAvailable: inspected.proAvailable === true,
   };
 }
 

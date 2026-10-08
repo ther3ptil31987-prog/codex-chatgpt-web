@@ -13,8 +13,9 @@ const preloadSource = fs.readFileSync(path.join(launcherRoot, "electron", "prelo
 test("Bigger Context waits for startup and route recovery without invalidating healthy setup", async () => {
   const vm = require("node:vm");
   for (const fails of [false, true]) {
-    let completeAuthentication;
-    const startupAuthenticationRefresh = new Promise(resolve => { completeAuthentication = resolve; });
+    const startupAuthenticationRefresh = new Promise(() => {});
+    let completeRuntime;
+    const runtimeReady = new Promise(resolve => { completeRuntime = resolve; });
     let finishRuntimeStartup;
     const runtimeStartup = new Promise(resolve => { finishRuntimeStartup = resolve; });
     let startupSettled = false;
@@ -35,6 +36,7 @@ test("Bigger Context waits for startup and route recovery without invalidating h
         readConfig: () => config,
         startIfConfigured: async () => {
           calls.push("startup");
+          await runtimeReady;
           if (fails) throw new Error("actual startup failure");
           return { status: "ready" };
         },
@@ -56,10 +58,11 @@ test("Bigger Context waits for startup and route recovery without invalidating h
     const start = electronMain.indexOf("} else void (async () => {");
     vm.runInContext(electronMain.slice(start + "} else ".length, electronMain.indexOf('  app.on("before-quit"', start)), context);
     const setting = handlers.get("launcher:bigger-context")({}, true);
-    // Read-only UI remains usable while authentication/startup is pending.
+    // Runtime startup proceeds even if the browser session check never completes.
+    // Settings still wait for runtime readiness, and read-only UI stays usable.
     assert.equal((await handlers.get("launcher:limits")()).enabled, false);
-    assert.deepEqual(calls, []);
-    completeAuthentication();
+    assert.deepEqual(calls, ["startup"]);
+    completeRuntime();
     await setting;
     assert.deepEqual(calls, fails ? ["startup", "recovery", "setting"] : ["startup", "route", "setting"]);
     assert.equal(state.experimentalBiggerContext, true);
@@ -381,15 +384,15 @@ test("MCP verification proves runtime health before checking the connector", () 
   assert.match(appSource, /operation\?\.name === "mcp-verification"/);
 });
 
-test("saved ChatGPT authentication is refreshed before setup is presented", () => {
+test("saved ChatGPT authentication refresh does not gate local runtime startup", () => {
   assert.match(electronMain, /browserHost\.refreshAuthentication\(\)/);
   const productionStartup = electronMain.indexOf("} else void (async () => {");
   const refreshBarrier = electronMain.indexOf("await startupAuthenticationRefresh", productionStartup);
   const upgrade = electronMain.indexOf("runtimeHost.upgradeManagedRuntime()", productionStartup);
   const runtimeStart = electronMain.indexOf("runtimeSupervisor.startIfConfigured()", upgrade);
   const routeConnect = electronMain.indexOf("runtimeHost.connectBridgeRoute()", runtimeStart);
-  assert.ok(refreshBarrier > productionStartup, "production startup must wait for saved-session refresh");
-  assert.ok(upgrade > refreshBarrier, "runtime upgrade must not inspect the browser before refresh settles");
+  assert.equal(refreshBarrier, -1, "the bridge must start while ChatGPT is signed out or unavailable");
+  assert.ok(upgrade > productionStartup);
   assert.ok(runtimeStart > upgrade, "configured runtime must start after any upgrade");
   assert.ok(routeConnect > runtimeStart, "Codex route must connect only after the runtime is healthy");
   assert.match(appSource, /browser\?\.status === "loading" \? copy\.checkingSignIn/);

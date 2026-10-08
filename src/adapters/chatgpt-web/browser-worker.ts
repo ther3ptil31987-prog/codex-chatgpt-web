@@ -75,11 +75,13 @@ import {
   notifyLauncherTurn,
 } from "../../launcher-browser-host";
 import {
-  CHATGPT_WEB_BIGGER_CONTEXT_MULTIPLIER,
+  CHATGPT_WEB_GPT6_SOL_BIGGER_CONTEXT_ERROR,
   resolveChatGptWebContextLimits,
   resolveChatGptWebMessageTokenBudget,
   resolveChatGptWebStagingTokenBudget,
   resolveChatGptWebTransportLimits,
+  supportsChatGptWebBiggerContext,
+  type ChatGptWebModelFamily,
 } from "../../chatgpt-web-models";
 import { LauncherBrowserHelperClient } from "./launcher-helper-client";
 import { assertChatGptModelFamily, selectChatGptModelFamily } from "./model-selection";
@@ -1080,6 +1082,7 @@ export function assertChatGptWebMultipartInputWithinLimits(
     finalMessageChars: number;
     finalImageTokens?: number;
   },
+  modelFamily?: ChatGptWebModelFamily,
 ): void {
   if (!isChatGptWebMultipartPartCount(partCount)) {
     throw new Error("Bigger Context requires two or six context parts");
@@ -1092,6 +1095,9 @@ export function assertChatGptWebMultipartInputWithinLimits(
   }
   if (modelId !== CHATGPT_WEB_MODEL_ID) {
     throw new Error(`ChatGPT Bigger Context limit is not defined for model: ${modelId}`);
+  }
+  if (!supportsChatGptWebBiggerContext(modelId, effort, capabilities, modelFamily)) {
+    throw new Error(CHATGPT_WEB_GPT6_SOL_BIGGER_CONTEXT_ERROR);
   }
   const { contextWindow: baseContextWindow } = resolveChatGptWebContextLimits(
     modelId,
@@ -1150,7 +1156,10 @@ export function assertChatGptWebMultipartInputWithinLimits(
     assertMessageBoundary("stage", estimatedMessageTokens, maxMessageChars, effort);
   }
   // More transport messages do not enlarge the model's advertised context window.
-  const experimentalContextWindow = baseContextWindow * Math.min(partCount, CHATGPT_WEB_BIGGER_CONTEXT_MULTIPLIER);
+  const { contextWindow } = resolveChatGptWebContextLimits(
+    modelId, effort, { ...capabilities, experimentalBiggerContext: true }, modelFamily,
+  );
+  const experimentalContextWindow = Math.min(contextWindow, baseContextWindow * partCount);
   if (estimatedInputTokens < experimentalContextWindow) return;
   const partLabel = partCount === 2 ? "two-part" : "six-part";
   throw new ChatGptWebAdapterError(
@@ -1479,12 +1488,13 @@ export function chatGptSubmissionEvidence(state: {
 }
 
 export async function setChatGptThinkMode(
-  composerForm: Locator,
+  composer: Locator,
   enabled: boolean,
   captureDiagnostic?: (checkpoint: string) => Promise<void>,
   abortSignal?: AbortSignal,
 ): Promise<void> {
   throwIfPromptAttachmentAborted(abortSignal);
+  const composerForm = composer.locator("xpath=ancestor::form[1]");
   const controls = composerForm
     .getByRole("button", { name: "Think", exact: true })
     .filter({ visible: true });
@@ -1502,7 +1512,6 @@ export async function setChatGptThinkMode(
   }
   const target = enabled ? "true" : "false";
   if (pressed !== target) {
-    const composer = composerForm.locator(CHATGPT_COMPOSER_SELECTOR).filter({ visible: true }).first();
     const composerState = () => composer.evaluate(element => {
       const copy = element.cloneNode(true) as HTMLElement;
       const pills = [...copy.querySelectorAll('[data-id^="plugin:"][data-keyword]')];
@@ -2601,7 +2610,7 @@ export class ChatGptBrowserWorker {
       }
       // Enable Think during prompt attachment, before fresh connector selection. Ordinary Luna
       // still clears a previous Think selection here; retained Think is checked on every attach.
-      if (!mode.thinkEnabled) await setChatGptThinkMode(composerForm, false, captureDiagnostic);
+      if (!mode.thinkEnabled) await setChatGptThinkMode(composer, false, captureDiagnostic);
       return mode;
     }
     const currentEffort = composerForm.locator(CHATGPT_EFFORT_CONTROL_SELECTOR).filter({ visible: true });
@@ -2807,22 +2816,25 @@ export class ChatGptBrowserWorker {
     page: Page,
     captureDiagnostic?: (checkpoint: string) => Promise<void>,
     useSavedChats = false,
+    abortSignal?: AbortSignal,
   ): Promise<Locator> {
+    throwIfPromptAttachmentAborted(abortSignal);
     // Launcher verification refreshes its owned page before attaching Playwright so a newly added
     // connector is present in the catalog. Navigating again here destroys that freshly hydrated
     // document and made the first verification race a second SPA bootstrap. A leased turn starts on
     // about:blank and therefore still performs exactly one navigation through this same method.
     const targetUrl = chatGptNewChatUrl(useSavedChats);
     if (page.url() !== targetUrl) {
-      await page.goto(targetUrl, {
+      await withBrowserTurnAbort(page.goto(targetUrl, {
         waitUntil: "domcontentloaded",
         timeout: 60_000,
-      });
+      }), abortSignal);
       await captureDiagnostic?.(useSavedChats ? "saved-chat-navigation-complete" : "temporary-chat-navigation-complete");
     }
     // A failed page read is not evidence of an expired login. Preserve the actual
     // observation error; the authenticated-session check below owns login failures.
-    const composer = await this.activeComposer(page);
+    const composer = await this.activeComposer(page, 30_000, abortSignal);
+    throwIfPromptAttachmentAborted(abortSignal);
     if (!useSavedChats && await dismissChatGptTemporaryChatOnboarding(page)) {
       await captureDiagnostic?.("temporary-chat-onboarding-dismissed");
     }
@@ -3721,7 +3733,7 @@ export class ChatGptBrowserWorker {
         await composer.fill("", { signal: abortSignal, timeout: CHATGPT_CONNECTOR_ACTION_TIMEOUT_MS });
         await composer.focus({ signal: abortSignal, timeout: CHATGPT_CONNECTOR_ACTION_TIMEOUT_MS });
         if (requireThink) {
-          await setChatGptThinkMode(composer.locator("xpath=ancestor::form[1]"), true, captureDiagnostic, abortSignal);
+          await setChatGptThinkMode(composer, true, captureDiagnostic, abortSignal);
         }
         await this.insertPromptText(page, prompt, abortSignal);
         await this.assertPromptAttached(page, prompt, abortSignal);
@@ -3731,7 +3743,7 @@ export class ChatGptBrowserWorker {
         const composer = await this.activeComposer(page, 30_000, abortSignal);
         composerMutationStarted = true;
         await composer.fill("", { signal: abortSignal, timeout: CHATGPT_CONNECTOR_ACTION_TIMEOUT_MS });
-        await setChatGptThinkMode(composer.locator("xpath=ancestor::form[1]"), true, captureDiagnostic, abortSignal);
+        await setChatGptThinkMode(composer, true, captureDiagnostic, abortSignal);
       }
       // A retained tab preserves history, but ChatGPT can require the plugin on each new
       // message. Reuse an existing selected pill only when selectConnector verifies it here.
@@ -4126,7 +4138,7 @@ export class ChatGptBrowserWorker {
 
   private async smokeTestExclusive(abortSignal?: AbortSignal): Promise<{ effort: string; response: string }> {
     const page = await this.ensurePage();
-    await this.prepareChatSurface(page);
+    await this.prepareChatSurface(page, undefined, false, abortSignal);
     const account = await detectChatGptAccountCapabilities(page);
     // Core smoke runs before the optional MCP connector is configured, so it must remain a
     // browser-only transport check. Connector setup has its own explicit verification operation.
@@ -4196,13 +4208,21 @@ export class ChatGptBrowserWorker {
         observer: MutationObserver;
         rendered: Map<HTMLElement, boolean>;
       };
-      type ObserverRegistry = { documentId: string; nextId: number; states: WeakMap<Element, ObserverState> };
+      type ObserverRegistry = {
+        documentId: string;
+        nextId: number;
+        nextNodeId: number;
+        nodeIds: WeakMap<Node, number>;
+        states: WeakMap<Element, ObserverState>;
+      };
       const scope = globalThis as typeof globalThis & {
         __CODEX_WEB_GPT_RESPONSE_OBSERVERS__?: ObserverRegistry;
       };
       const registry = scope.__CODEX_WEB_GPT_RESPONSE_OBSERVERS__ ??= {
         documentId: `${performance.timeOrigin}:${Math.random().toString(36).slice(2)}`,
         nextId: 0,
+        nextNodeId: 0,
+        nodeIds: new WeakMap(),
         states: new WeakMap<Element, ObserverState>(),
       };
       let observerState = registry.states.get(root);
@@ -4329,8 +4349,12 @@ export class ChatGptBrowserWorker {
       const commentaryRoots = classified.commentaryRoots;
       const renderedRoots = classified.answerRoots;
       // CHATGPT_MARKDOWN_CONTENT_BEGIN
-      const chatGptMarkdownContent = (markdownRoot: HTMLElement): HTMLElement => {
+      const chatGptMarkdownContent = (
+        markdownRoot: HTMLElement,
+        onClone?: (original: HTMLElement, clone: HTMLElement) => void,
+      ): HTMLElement => {
         const content = markdownRoot.cloneNode(true) as HTMLElement;
+        onClone?.(markdownRoot, content);
         // A formula's visual and accessibility layers hydrate independently. Compare
         // its TeX source, just as Markdown conversion does, so cosmetic changes cannot
         // look like an edit to text already delivered to Codex.
@@ -4410,6 +4434,7 @@ export class ChatGptBrowserWorker {
       // answer is finalized. Root boundaries and visible indices therefore are not identity:
       // flatten semantic blocks and preserve ChatGPT's source ranges across that reparenting.
       const flattenedMarkdownSegments: Array<{
+        nodeKey: string;
         tag: string;
         html: string;
         text: string;
@@ -4445,6 +4470,24 @@ export class ChatGptBrowserWorker {
         return parts.join("").trim();
       };
       // CHATGPT_MARKDOWN_CONTENT_END
+      // A DOM position is not a block identity: a file preview leaving the answer
+      // must not give the following paragraph the preview's already committed key.
+      const nodeKey = (node: Node): string => {
+        let id = registry.nodeIds.get(node);
+        if (id === undefined) {
+          id = registry.nextNodeId++;
+          registry.nodeIds.set(node, id);
+        }
+        return `dom:${registry.documentId}:${id}`;
+      };
+      const rememberClone = (original: HTMLElement, clone: HTMLElement): void => {
+        const source = document.createTreeWalker(original, NodeFilter.SHOW_ALL);
+        const copied = document.createTreeWalker(clone, NodeFilter.SHOW_ALL);
+        do {
+          nodeKey(source.currentNode);
+          registry.nodeIds.set(copied.currentNode, registry.nodeIds.get(source.currentNode)!);
+        } while (source.nextNode() && copied.nextNode());
+      };
       let listGroupIndex = 0;
       const sourceRange = (candidate: Element): { sourceStart: number; sourceEnd: number } | undefined => {
         const startAttribute = candidate.getAttribute("data-start");
@@ -4478,6 +4521,7 @@ export class ChatGptBrowserWorker {
           : [];
         if (listItems.length === 0) {
           flattenedMarkdownSegments.push({
+            nodeKey: nodeKey(child),
             tag,
             html: child.outerHTML,
             text: markdownText(child),
@@ -4499,6 +4543,7 @@ export class ChatGptBrowserWorker {
           }
           shell.append(item.cloneNode(true));
           flattenedMarkdownSegments.push({
+            nodeKey: nodeKey(item),
             tag: `${tag}:item`,
             html: shell.outerHTML,
             text: markdownText(item),
@@ -4508,11 +4553,12 @@ export class ChatGptBrowserWorker {
           });
         });
       };
-      renderedRoots.map(chatGptMarkdownContent).forEach((markdownRoot) => {
+      renderedRoots.map(root => chatGptMarkdownContent(root, rememberClone)).forEach((markdownRoot) => {
         const children = [...markdownRoot.children] as HTMLElement[];
         const hasBlockChildren = children.some(child => blockMarkdownTags.has(child.tagName.toLowerCase()));
         if (!hasBlockChildren) {
           if (markdownRoot.innerHTML.trim()) flattenedMarkdownSegments.push({
+            nodeKey: nodeKey(markdownRoot),
             tag: "root",
             html: markdownRoot.innerHTML,
             text: markdownText(markdownRoot),
@@ -4538,6 +4584,7 @@ export class ChatGptBrowserWorker {
               .map(sourceRange)
               .filter((range): range is { sourceStart: number; sourceEnd: number } => range !== undefined);
             flattenedMarkdownSegments.push({
+              nodeKey: nodeKey(nodes[0]!),
               tag: "inline",
               html: shell.outerHTML,
               text,
@@ -4563,7 +4610,7 @@ export class ChatGptBrowserWorker {
       const markdownSegments = flattenedMarkdownSegments.map((segment, index, segments) => ({
         key: segment.sourceStart !== undefined
           ? `${segment.sourceStart}:${segment.tag}`
-          : `${index}:${segment.tag}`,
+          : `${segment.nodeKey}:${segment.tag}`,
         tag: segment.tag,
         html: segment.html,
         text: segment.text,
@@ -4993,6 +5040,12 @@ export class ChatGptBrowserWorker {
           maxStageChars!,
         )
         : requestedMode;
+      // Pro's inert context uploads have always used 5.6 Sol. Pin that existing
+      // transport explicitly now that Latest/GPT-6 uses 6 Sol at lower efforts.
+      // The final answer still selects and verifies the requested Pro family.
+      const stagingFamily = multipartStages && turn.modelFamily === "6"
+        && requestedMode.effort === "max" && stagingMode.effort !== "max"
+        ? "5.6" : turn.modelFamily;
       if (prepared.multipart) {
         assertChatGptWebMultipartInputWithinLimits(
           estimatedInputTokens,
@@ -5013,6 +5066,7 @@ export class ChatGptBrowserWorker {
             finalMessageChars: multipartFinalPrompt.length,
             finalImageTokens: estimateChatGptWebImageTokens(prepared),
           } : undefined,
+          turn.modelFamily,
         );
       } else {
         assertChatGptWebInputWithinLimits(
@@ -5175,6 +5229,7 @@ export class ChatGptBrowserWorker {
             page,
             checkpoint => diagnostics.capture(page, checkpoint),
             this.config.useSavedChats,
+            turn.abortSignal,
           ),
         );
       }
@@ -5188,7 +5243,7 @@ export class ChatGptBrowserWorker {
           browserCapabilities,
           checkpoint => diagnostics.capture(page, checkpoint),
           trackUsage,
-          turn.modelFamily,
+          stagingFamily,
         )
       );
       let mode = await this.runStage(turn.traceId, "effort_selection", browserStageTimeouts.effortSelection, selectStagingMode);
@@ -5396,6 +5451,7 @@ export class ChatGptBrowserWorker {
                 page,
                 checkpoint => diagnostics.capture(page, checkpoint),
                 this.config.useSavedChats,
+                turn.abortSignal,
               );
               mode = await this.selectModelAndEffort(
                 page,

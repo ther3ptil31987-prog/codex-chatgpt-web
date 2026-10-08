@@ -70,52 +70,79 @@ function validateReleaseAssetUrl(raw, version, assetName) {
   return url.toString();
 }
 
-function createUpdateDownloader(fetch, idleTimeoutMs = 60_000) {
+function createUpdateDownloader(createRequest, idleTimeoutMs = 60_000) {
+  const validateUrl = value => {
+    const url = new URL(value);
+    if (url.protocol !== "https:" || url.username || url.password) {
+      throw new Error("Refusing non-HTTPS or credential-bearing update URL");
+    }
+    return url.toString();
+  };
+
   async function* chunks(url) {
-    const controller = new AbortController();
+    const request = createRequest({
+      url: validateUrl(url),
+      headers: { Accept: "application/vnd.github+json", "User-Agent": USER_AGENT },
+      credentials: "omit",
+      cache: "no-store",
+      redirect: "manual",
+    });
     let timer;
+    let response;
+    let failure;
+    let finished = false;
+    let rejectResponse;
+    const fail = error => {
+      if (finished || failure) return;
+      failure = error;
+      rejectResponse(error);
+      response?.destroy(error);
+      request.abort();
+    };
     const armTimeout = () => {
       clearTimeout(timer);
-      timer = setTimeout(() => controller.abort(new Error("Update request timed out")), idleTimeoutMs);
+      timer = setTimeout(() => fail(new Error("Update request timed out")), idleTimeoutMs);
       timer.unref?.();
     };
-    armTimeout();
     try {
-      for (let redirects = 0; ; redirects += 1) {
-        if (redirects > MAX_REDIRECTS) throw new Error("Too many redirects while downloading update");
-        const parsed = new URL(url);
-        if (parsed.protocol !== "https:" || parsed.username || parsed.password) {
-          throw new Error("Refusing non-HTTPS or credential-bearing update URL");
-        }
-        const response = await fetch(parsed.toString(), {
-          headers: { Accept: "application/vnd.github+json", "User-Agent": USER_AGENT },
-          credentials: "omit",
-          cache: "no-store",
-          redirect: "manual",
-          signal: controller.signal,
+      await new Promise((resolve, reject) => {
+        rejectResponse = reject;
+        let redirects = 0;
+        request.on("error", fail);
+        request.on("abort", () => fail(new Error("Update download was aborted")));
+        // net.fetch cancels manual redirects instead of exposing a 3xx response.
+        // ClientRequest lets us validate every destination before following it.
+        request.on("redirect", (_status, _method, destination) => {
+          try {
+            if (++redirects > MAX_REDIRECTS) throw new Error("Too many redirects while downloading update");
+            validateUrl(destination);
+            armTimeout();
+            request.followRedirect();
+          } catch (error) {
+            fail(error);
+          }
         });
-        const location = response.headers.get("location");
-        if ([301, 302, 303, 307, 308].includes(response.status) && location) {
-          await response.body?.cancel();
-          url = new URL(location, parsed).toString();
-          armTimeout();
-          continue;
-        }
-        if (response.status !== 200) {
-          await response.body?.cancel();
-          throw new Error(`Update download failed with HTTP ${response.status}`);
-        }
-        if (!response.body) throw new Error("Update download returned no body");
+        request.once("response", incoming => {
+          response = incoming;
+          response.on("error", fail);
+          response.on("aborted", () => fail(new Error("Update download was interrupted")));
+          resolve();
+        });
         armTimeout();
-        for await (const chunk of response.body) {
-          armTimeout();
-          yield chunk;
-        }
-        return;
+        request.end();
+      });
+      if (failure) throw failure;
+      if (response.statusCode !== 200) throw new Error(`Update download failed with HTTP ${response.statusCode}`);
+      armTimeout();
+      for await (const chunk of response) {
+        armTimeout();
+        yield chunk;
       }
     } finally {
+      finished = true;
       clearTimeout(timer);
-      controller.abort();
+      response?.destroy();
+      request.abort();
     }
   }
 
@@ -228,7 +255,7 @@ function defaultDependencies() {
   // Chromium owns the launcher's system proxy/PAC policy. Do not bypass it with
   // Node HTTPS or borrow cookies from the authenticated ChatGPT browser profile.
   const { downloadText, downloadFile } = createUpdateDownloader(
-    (url, options) => require("electron").net.fetch(url, options),
+    options => require("electron").net.request(options),
   );
   return {
     fetchRelease: async () => JSON.parse(await downloadText(RELEASE_API_URL)),
