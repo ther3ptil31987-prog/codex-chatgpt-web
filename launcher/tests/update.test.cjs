@@ -162,6 +162,58 @@ test("startup check runs once and exposes only a newer complete release", async 
   assert.deepEqual(published.map((state) => state.status), ["checking", "available"]);
 });
 
+test("a failed startup check is retried on a bounded schedule; a successful one is not repeated", async () => {
+  const release = {
+    tag_name: "v1.2.0",
+    assets: ["codex-web-gpt-1.2.0-linux-x64.AppImage", "checksums.txt"].map(name => ({
+      name,
+      browser_download_url: `https://github.com/miuuyy/codex-chatgpt-web/releases/download/v1.2.0/${name}`,
+    })),
+  };
+  const controllerFor = (retryDelaysMs, fetchRelease, logged = []) => createUpdateController({
+    currentVersion: "1.1.4",
+    platform: "linux",
+    arch: "x64",
+    packaged: true,
+    executablePath: "/tmp/launcher",
+    runtimeExecutable: "/tmp/bun",
+    logsDirectory: "/tmp/logs",
+    retryDelaysMs,
+    logger: { info() {}, warn: (event, detail) => logged.push({ event, detail }) },
+    dependencies: { fetchRelease },
+  });
+  const settle = () => new Promise(resolve => setTimeout(resolve, 60));
+
+  let calls = 0;
+  const logged = [];
+  // Offline at sign-in, then a release whose assets are still uploading, then the complete release.
+  const recovering = controllerFor([5, 5, 5], async () => {
+    calls += 1;
+    if (calls === 1) throw new Error("net::ERR_INTERNET_DISCONNECTED");
+    if (calls === 2) return { ...release, assets: [] };
+    return release;
+  }, logged);
+  assert.equal((await recovering.checkOnce()).status, "error");
+  await settle();
+  assert.deepEqual(recovering.getState(), { status: "available", version: "1.2.0" });
+  assert.equal(calls, 3);
+  assert.deepEqual(logged.map(entry => entry.detail.retryInMs), [5, 5]);
+  await settle();
+  assert.equal(calls, 3);
+
+  let failures = 0;
+  const exhausted = controllerFor([5], async () => {
+    failures += 1;
+    throw new Error("offline");
+  });
+  await exhausted.checkOnce();
+  await settle();
+  assert.deepEqual(exhausted.getState(), { status: "error", message: "offline" });
+  assert.equal(failures, 2);
+  assert.equal((await exhausted.checkOnce()).status, "error");
+  assert.equal(failures, 2);
+});
+
 test("preview and draft releases stay hidden until promoted, regardless of the version suffix", async () => {
   for (const tag of ["1.2.0", "1.2.0-rc.1"]) {
     for (const flags of [{ prerelease: true }, { draft: true }, { prerelease: false, draft: false }]) {

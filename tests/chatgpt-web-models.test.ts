@@ -232,9 +232,9 @@ describe("fixed ChatGPT Web model routes", () => {
       extraHighAvailable: false, proAvailable: false,
       experimentalBiggerContext: true,
     })).toEqual({
-      contextWindow: 1_050_000,
-      effectiveContextWindowPercent: 100,
-      autoCompactTokenLimit: 1_050_000,
+      contextWindow: 84_000,
+      effectiveContextWindowPercent: 71,
+      autoCompactTokenLimit: 59_424,
     });
   });
 

@@ -31,7 +31,6 @@ import {
 } from "./codex-integration";
 import {
   CHATGPT_WEB_LUNA_BACKEND_MODEL,
-  CHATGPT_WEB_LUNA_BIGGER_CONTEXT_ERROR,
   isChatGptWebModelSlug,
   requireChatGptWebModelRoute,
   type ChatGptWebModelRoute,
@@ -397,24 +396,156 @@ function modelCatalogFailure(stage: ModelCatalogFailure["stage"], error: unknown
   return { stage };
 }
 
+type UpstreamModelCatalog =
+  | { ok: true; status: number; statusText: string; headers: Headers; body: ArrayBuffer }
+  | { ok: false; error: unknown; sent: boolean };
+
+/**
+ * Codex abandons a catalog request after five seconds and retries. When the first HTTPS connection
+ * of a network takes longer than that, cancelling the upstream attempt together with each client
+ * made every retry start from nothing, so the catalog never loaded (#696). The upstream GET is
+ * idempotent: one attempt per identical request keeps running for the client that retries, and is
+ * dropped only after nobody has waited for it for a while. Responses are never reused across
+ * different request headers, and a failure is never kept.
+ */
+export class ModelCatalogFetches {
+  private readonly attempts = new Map<string, {
+    result: Promise<UpstreamModelCatalog>;
+    abort: AbortController;
+    waiters: number;
+    sent: boolean;
+    timer?: ReturnType<typeof setTimeout>;
+  }>();
+
+  constructor(
+    private readonly abandonedTimeoutMs = 30_000,
+    private readonly unclaimedResultMs = 10_000,
+  ) {}
+
+  async fetch(
+    request: Request,
+    forward: (request: Request, markSent: () => void) => Promise<Response>,
+  ): Promise<UpstreamModelCatalog> {
+    const key = createHash("sha256")
+      .update(JSON.stringify([new URL(request.url).search, [...request.headers].sort()]))
+      .digest("hex");
+    let attempt = this.attempts.get(key);
+    if (!attempt) {
+      const abort = new AbortController();
+      const created = {
+        abort,
+        waiters: 0,
+        sent: false,
+        result: undefined as unknown as Promise<UpstreamModelCatalog>,
+        timer: undefined as ReturnType<typeof setTimeout> | undefined,
+      };
+      created.result = (async (): Promise<UpstreamModelCatalog> => {
+        try {
+          const response = await forward(new Request(request, { signal: abort.signal }), () => { created.sent = true; });
+          return {
+            ok: true, status: response.status, statusText: response.statusText,
+            headers: response.headers, body: await response.arrayBuffer(),
+          };
+        } catch (error) {
+          return { ok: false, error, sent: created.sent };
+        }
+      })().then(result => {
+        clearTimeout(created.timer);
+        created.timer = undefined;
+        // A client that retries just after its abandoned attempt finished may still take the result.
+        const unclaimed = result.ok && result.status >= 200 && result.status < 300 && created.waiters === 0;
+        if (unclaimed && this.attempts.get(key) === created) {
+          created.timer = setTimeout(() => {
+            if (this.attempts.get(key) === created) this.attempts.delete(key);
+          }, this.unclaimedResultMs);
+          created.timer.unref?.();
+        } else if (this.attempts.get(key) === created) {
+          this.attempts.delete(key);
+        }
+        return result;
+      });
+      attempt = created;
+      this.attempts.set(key, attempt);
+    }
+    const joined = attempt;
+    joined.waiters += 1;
+    clearTimeout(joined.timer);
+    joined.timer = undefined;
+    let leave!: () => void;
+    const left = new Promise<UpstreamModelCatalog>(resolve => {
+      leave = () => resolve({
+        ok: false,
+        error: request.signal.reason ?? new DOMException("Model catalog request aborted", "AbortError"),
+        sent: joined.sent,
+      });
+    });
+    if (request.signal.aborted) leave();
+    else request.signal.addEventListener("abort", leave, { once: true });
+    try {
+      const result = await Promise.race([joined.result, left]);
+      if (result.ok && this.attempts.get(key) === joined) {
+        // Delivered: the next request must ask upstream again.
+        clearTimeout(joined.timer);
+        this.attempts.delete(key);
+      }
+      return result;
+    } finally {
+      request.signal.removeEventListener("abort", leave);
+      joined.waiters -= 1;
+      if (joined.waiters === 0 && this.attempts.get(key) === joined && !joined.timer) {
+        joined.timer = setTimeout(() => joined.abort.abort(
+          new DOMException("Model catalog request was abandoned", "AbortError"),
+        ), this.abandonedTimeoutMs);
+        joined.timer.unref?.();
+      }
+    }
+  }
+
+  close(): void {
+    for (const attempt of this.attempts.values()) {
+      clearTimeout(attempt.timer);
+      attempt.abort.abort(new DOMException("Model catalog request cancelled", "AbortError"));
+    }
+    this.attempts.clear();
+  }
+}
+
 export async function modelsRequest(
   req: Request,
   config: AppConfig,
   fetchUpstream?: NativeFetch,
   contextOverride?: () => CodexModelContextOverride | undefined,
   onFailure?: (failure: ModelCatalogFailure) => void,
+  clientSignal: AbortSignal = req.signal,
+  shared?: ModelCatalogFetches,
 ): Promise<Response> {
+  const cancelled = () => new Response(null, { status: 499 });
+  if (clientSignal.aborted) return cancelled();
   let upstream: Response;
   let sent = false;
+  const forward = (request: Request, markSent: () => void) => forwardNativeCodexRequest(request, "models", input => {
+    markSent();
+    return (fetchUpstream ?? fetchNativeCodex)(input);
+  });
   try {
-    upstream = await forwardNativeCodexRequest(req, "models", input => {
-      sent = true;
-      return (fetchUpstream ?? fetchNativeCodex)(input);
-    });
+    if (shared) {
+      const result = await shared.fetch(req, forward);
+      if (!result.ok) {
+        sent = result.sent;
+        throw result.error;
+      }
+      upstream = new Response([101, 204, 205, 304].includes(result.status) ? null : result.body.slice(0), {
+        status: result.status, statusText: result.statusText, headers: new Headers(result.headers),
+      });
+    } else {
+      upstream = await forward(req, () => { sent = true; });
+    }
   } catch (error) {
+    if (clientSignal.aborted) return cancelled();
     onFailure?.(modelCatalogFailure(sent ? "transport" : "request", error));
     return formatErrorResponse(502, "upstream_error", error instanceof Error ? error.message : String(error));
   }
+  if (clientSignal.aborted) return cancelled();
   if (!upstream.ok) {
     onFailure?.({ stage: "upstream" });
     return upstream;
@@ -423,9 +554,11 @@ export async function modelsRequest(
   try {
     catalog = augmentNativeModelCatalog(await upstream.json(), config, contextOverride?.());
   } catch (error) {
+    if (clientSignal.aborted) return cancelled();
     onFailure?.(modelCatalogFailure("catalog", error));
     return formatErrorResponse(502, "invalid_response_error", error instanceof Error ? error.message : String(error));
   }
+  if (clientSignal.aborted) return cancelled();
   const body = JSON.stringify(catalog);
   const headers = new Headers(upstream.headers);
   headers.delete("content-encoding");
@@ -522,9 +655,6 @@ export async function responseRequest(
   try {
     parsed = parseRequest(expanded);
     route = routeChatGptWebRequest(parsed, config);
-    if (config.experimentalBiggerContext && route.backendModel === CHATGPT_WEB_LUNA_BACKEND_MODEL) {
-      throw new Error(CHATGPT_WEB_LUNA_BIGGER_CONTEXT_ERROR);
-    }
     const identity = extractChatGptTurnIdentity(parsed);
     if (identity.threadId && identity.turnId) {
       options.onTurnIdentity?.({ threadId: identity.threadId, turnId: identity.turnId });
@@ -578,7 +708,7 @@ export async function responseRequest(
     });
     rememberCompactionContinuation(parsed, identity, [source, v1Source], summary);
   };
-  if (compaction && route.backendModel === CHATGPT_WEB_LUNA_BACKEND_MODEL) {
+  if (compaction && route.backendModel === CHATGPT_WEB_LUNA_BACKEND_MODEL && !config.experimentalBiggerContext) {
     return formatErrorResponse(
       409,
       "invalid_request_error",
@@ -754,7 +884,7 @@ export async function compactRequest(
   } catch (error) {
     return formatErrorResponse(400, "invalid_request_error", error instanceof Error ? error.message : String(error));
   }
-  if (route.backendModel === CHATGPT_WEB_LUNA_BACKEND_MODEL) {
+  if (route.backendModel === CHATGPT_WEB_LUNA_BACKEND_MODEL && !config.experimentalBiggerContext) {
     return formatErrorResponse(
       409,
       "invalid_request_error",
@@ -814,7 +944,11 @@ export async function compactRequest(
 
 export function startServer(
   config: AppConfig,
-  dependencies: { fetchUpstream?: NativeFetch; adapterFactory?: ChatGptWebAdapterFactory } = {},
+  dependencies: {
+    fetchUpstream?: NativeFetch;
+    adapterFactory?: ChatGptWebAdapterFactory;
+    modelCatalogFetches?: ModelCatalogFetches;
+  } = {},
 ): ReturnType<typeof Bun.serve> {
   if (config.purpose === "dev-harness") {
     throw new Error("DEV harness configuration cannot start a Responses listener");
@@ -837,6 +971,7 @@ export function startServer(
     request: number; at: string; status: number; failure?: ModelCatalogFailure;
   } | null = null;
   const httpTurns = new HttpTurnCounter();
+  const modelCatalogFetches = dependencies.modelCatalogFetches ?? new ModelCatalogFetches();
   const activity = () => ({
     active_http_turns: httpTurns.count(),
     active_browser_turns: chatGptTurnSessions.activeCount() + (turnBroker?.externalOwnerActiveCount() ?? 0),
@@ -853,6 +988,16 @@ export function startServer(
     idleTimeout: 0,
     async fetch(req) {
       const url = new URL(req.url);
+      // Loopback is reachable from any web page, cross-site or same-origin after DNS rebinding,
+      // and this route has no bearer secret. Browsers attach Origin to every such request that
+      // can start or control work; Codex and the launcher are not browsers and never send it.
+      if (req.method !== "GET" && req.headers.has("origin")) {
+        return formatErrorResponse(
+          403,
+          "invalid_request_error",
+          "Browser-originated requests are not accepted by the local Codex route",
+        );
+      }
       if (req.method === "GET" && url.pathname === "/healthz") {
         return Response.json({
           status: "ok",
@@ -1022,6 +1167,9 @@ export function startServer(
           const request = ++modelCatalogRequests;
           const started = Date.now();
           const recordResult = (response: Response, failure?: ModelCatalogFailure): Response => {
+            // A disconnected Codex client did not test the catalog. Preserve the
+            // last completed result; only actual failures belong in launcher health.
+            if (req.signal.aborted) return response;
             const result = { request, at: new Date().toISOString(), status: response.status, ...(failure ? { failure } : {}) };
             // An older, slower request must not replace a newer completed result.
             if (!lastModelCatalogResult || request > lastModelCatalogResult.request) lastModelCatalogResult = result;
@@ -1052,8 +1200,10 @@ export function startServer(
             dependencies.fetchUpstream,
             readCodexModelContextOverride,
             value => { failure = value; },
+            req.signal,
+            modelCatalogFetches,
           );
-          if (response.ok) {
+          if (response.ok && !req.signal.aborted) {
             successfulModelCatalogRequests += 1;
             lastSuccessfulModelCatalogRequestAt = new Date().toISOString();
           }
@@ -1123,6 +1273,7 @@ export function startServer(
     if (shutdownPromise) return;
     draining = true;
     chatGptTurnSessions.clear();
+    modelCatalogFetches.close();
     flushResponseState();
     shutdownPromise = (async () => {
       const results = await Promise.allSettled([

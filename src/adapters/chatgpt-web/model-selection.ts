@@ -1,4 +1,4 @@
-import { activateChatGptEffortMenu, parseChatGptEffortSliderState, readChatGptModelAnnouncements } from "../../chatgpt-session";
+import { activateChatGptEffortMenu, parseChatGptEffortSliderState, parseChatGptModelAnnouncement, readChatGptModelAnnouncements } from "../../chatgpt-session";
 import type { ChatGptWebAdapterEffort, ChatGptWebModelFamily } from "../../chatgpt-web-models";
 import { ChatGptWebAdapterError } from "./adapter-error";
 
@@ -75,9 +75,8 @@ export function chatGptModelFamilyMatches(
   // 5.6 at lower efforts; that is not proof of an explicitly requested GPT-6 turn.
   const expectedName = family === "6" && effort === "max" ? "astra" : "sol";
   const states = descriptions.flatMap(text => {
-    const match = /^(?:GPT[-\s]?)?(\d+(?:\.\d+)?)(?:\s+(Sol|Astra))?\s+([^,，]+)(?:[,，]|$)/i
-      .exec(text.replace(/\s+/g, " ").trim());
-    return match ? [{ version: match[1], name: match[2]?.toLowerCase(), mode: match[3]!.trim() }] : [];
+    const state = parseChatGptModelAnnouncement(text);
+    return state ? [state] : [];
   });
   return states.length > 0 && states.every(state => state.version === family
     && (!state.name || state.name === expectedName)

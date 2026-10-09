@@ -211,6 +211,8 @@ class RuntimeHost {
     this.lifecycleOperation = null;
     this.cleanupEphemeralSecrets();
     this.passkeyContinuationRequested = false;
+    this.passkeyPhase = null;
+    this.passkeyProgress = null;
     try {
       this.cleanupPasskeyTransfers();
     } catch (error) {
@@ -300,6 +302,7 @@ class RuntimeHost {
   continuePasskeyLogin() {
     const child = this.activeChild;
     if (this.active !== "passkey-login"
+      || this.passkeyPhase !== "waiting"
       || this.passkeyContinuationRequested
       || !child
       || child.exitCode !== null
@@ -308,6 +311,8 @@ class RuntimeHost {
       throw new Error("No passkey sign-in is waiting for Continue");
     }
     this.passkeyContinuationRequested = true;
+    this.passkeyPhase = "importing";
+    this.passkeyProgress?.("importing");
     this.publishOperation?.({
       name: "passkey-login",
       status: "running",
@@ -319,6 +324,8 @@ class RuntimeHost {
         error => {
           if (error) {
             this.passkeyContinuationRequested = false;
+            this.passkeyPhase = "waiting";
+            this.passkeyProgress?.("waiting");
             reject(error);
           } else {
             resolve(true);
@@ -328,7 +335,7 @@ class RuntimeHost {
     });
   }
 
-  async capturePasskeyLogin() {
+  async capturePasskeyLogin(onProgress = () => {}) {
     this.cleanupPasskeyTransfers();
     const chrome = this.passkeyChromeExecutable();
     const parent = path.join(this.app.getPath("userData"), "passkey-login");
@@ -340,7 +347,10 @@ class RuntimeHost {
     const markerPath = `${storageStatePath}.verified.json`;
     const cleanup = async () => fs.rmSync(transferRoot, { recursive: true, force: true });
     this.passkeyContinuationRequested = false;
+    this.passkeyPhase = "opening";
+    this.passkeyProgress = onProgress;
     try {
+      onProgress("opening");
       await this.run("passkey-login", [
         "login",
         "--launcher-control",
@@ -352,6 +362,15 @@ class RuntimeHost {
         embedded: true,
         controlStdin: true,
         env: this.launcherControlEnvironment(),
+        onStdoutLine: line => {
+          let event;
+          try { event = JSON.parse(line); } catch { return; }
+          if (event?.version === 1 && event.type === "passkey-login-ready" && this.passkeyPhase === "opening") {
+            this.passkeyPhase = "waiting";
+            onProgress("waiting");
+            return true;
+          }
+        },
         message: "Sign in with your passkey in Chrome, then return here and choose Continue",
         successMessage: "Passkey session captured for private Launcher verification",
         timeoutMs: PASSKEY_LOGIN_TIMEOUT_MS,
@@ -380,6 +399,8 @@ class RuntimeHost {
       throw error;
     } finally {
       this.passkeyContinuationRequested = false;
+      this.passkeyPhase = null;
+      this.passkeyProgress = null;
     }
   }
 
@@ -639,7 +660,9 @@ class RuntimeHost {
         };
         collect(child.stdout, stdout, (line) => {
           this.logger.info("runtime.stdout", { operation: name, line });
-          this.publishOperation?.({ name, status: "running", message: redactText(line) });
+          if (options.onStdoutLine?.(line) !== true) {
+            this.publishOperation?.({ name, status: "running", message: redactText(line) });
+          }
         }, recordPipeError("stdout"));
         collect(child.stderr, stderr, (line) => {
           this.logger.warn("runtime.stderr", { operation: name, line });
@@ -839,8 +862,10 @@ class RuntimeHost {
 
   async restoreBridgeRouteWithinOperation(operationName) {
     const current = await this.bridgeStatus(operationName);
-    if (!current.installed || !current.active) return current;
-    const disconnected = await this.run(operationName, ["route", "disconnect"], {
+    const forRuntimeRecovery = operationName === "runtime-start-fail-safe";
+    if (!current.installed || (!current.active && (forRuntimeRecovery || !current.reconnectOnStartup))) return current;
+    const disconnected = await this.run(operationName, ["route", "disconnect",
+      ...(forRuntimeRecovery ? ["--for-runtime-recovery"] : [])], {
       embedded: true,
       message: "Restoring the previous Codex route",
       successMessage: "Previous Codex route restored",
@@ -848,7 +873,7 @@ class RuntimeHost {
     });
     const result = parseBridgeRouteResult(disconnected.stdout, { expectedActive: false });
     const verified = await this.bridgeStatus(operationName);
-    if (!verified.installed || verified.active) {
+    if (!verified.installed || verified.active || (!forRuntimeRecovery && verified.reconnectOnStartup)) {
       throw new Error("Codex bridge route restore did not persist in the active config");
     }
     return {
@@ -867,7 +892,7 @@ class RuntimeHost {
     }
   }
 
-  async connectBridgeRoute() {
+  async connectBridgeRoute({ recoveryOnly = false } = {}) {
     this.assertProductionProfile("Codex bridge routing");
     const name = "bridge-connect";
     if (this.currentOperation()) throw new Error(`Another launcher operation is active: ${this.currentOperation()}`);
@@ -875,17 +900,17 @@ class RuntimeHost {
     try {
       const current = await this.bridgeStatus(name);
       if (!current.installed) throw new Error("Install the Codex integration before connecting the bridge route");
-      if (current.active) return current;
+      if (current.active || (recoveryOnly && current.reconnectOnStartup !== true)) return current;
       try {
-        const connected = await this.run(name, ["route", "connect"], {
+        const connected = await this.run(name, ["route", recoveryOnly ? "recover" : "connect"], {
           embedded: true,
           message: "Connecting Codex to the launcher",
           successMessage: "Codex bridge connected",
           timeoutMs: 15_000,
         });
-        const result = parseBridgeRouteResult(connected.stdout, { expectedActive: true });
+        const result = parseBridgeRouteResult(connected.stdout, recoveryOnly ? {} : { expectedActive: true });
         const verified = await this.bridgeStatus(name);
-        if (!verified.installed || !verified.active) {
+        if (!verified.installed || verified.active !== result.active) {
           throw new Error("Codex bridge route connection did not persist in the active config");
         }
         return result;
@@ -1094,9 +1119,6 @@ class RuntimeHost {
     const current = this.runtimeConfigSnapshot();
     if (!current.configured) {
       throw new Error("Initialize the runtime before changing Bigger Context");
-    }
-    if (enabled === true && current.config?.solAvailable !== true) {
-      throw new Error("Bigger Context requires Sol or Pro in the launcher's model list. It is unavailable for Luna and Think.");
     }
     const mode = current.mode;
     const contextFlag = enabled === true ? "--bigger-context" : "--standard-context";
@@ -1327,6 +1349,7 @@ class RuntimeHost {
       "--acknowledge-unofficial",
       "--restart-service",
     ];
+    args.push("--preserve-disconnected-route");
     const result = await this.runSetup("runtime-upgrade", args, {
       message: tunnelProfileMigrationRequired
         ? `Separating ${interactionMode === "manual" ? "Zero Risk" : "Automatic"} MCP credentials`

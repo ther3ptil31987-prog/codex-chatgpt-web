@@ -30,8 +30,10 @@ function redactHttpUrls(value) {
 
 function redactExportText(value) {
   return redactHttpUrls(redactText(value))
-    .replace(/\b[A-Za-z]:\\+Users\\+[^\\/\r\n"'`<>|]+/gi, "[user-home]")
-    .replace(/\/(?:Users|home)\/[^/\r\n"'`<>]+/g, "[user-home]")
+    // The drive is optional: WSL and other UNC homes (\\wsl.localhost\Ubuntu\home\name) have none.
+    .replace(/(?:\b[A-Za-z]:)?\\+(?:Users|home)\\+[^\\/\r\n"'`<>|]+/gi, "[user-home]")
+    // Windows paths are also logged lowercased and with forward slashes (c:/users/name).
+    .replace(/\/(?:Users|home)\/[^/\r\n"'`<>]+/gi, "[user-home]")
     .replace(/((?:visible rows|sidebar (?:rows|titles)|conversation titles):)\s*[^\r\n]*/gi, "$1 [redacted]");
 }
 

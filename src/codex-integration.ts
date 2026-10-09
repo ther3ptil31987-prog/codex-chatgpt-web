@@ -300,7 +300,13 @@ export function installCodexIntegration(
       } : {}),
       ...(existing.format ? { format: existing.format } : {}),
     };
-    writeIntegrationState(updated, { path: configPath, data: patched.text }, [getCodexModelsCachePath()]);
+    let installedText = patched.text;
+    if (options.preserveDisconnectedRoute && !managedJournalIsActive(existing)) {
+      installedText = restoreManagedRoute(patched.text, updated);
+      updated.active = false;
+      if (existing.reconnectOnStartup) updated.reconnectOnStartup = true;
+    }
+    writeIntegrationState(updated, { path: configPath, data: installedText }, [getCodexModelsCachePath()]);
     return updated;
   }
 
@@ -345,7 +351,7 @@ export function installCodexIntegration(
   return journal;
 }
 
-export function deactivateCodexIntegration(): SetCodexIntegrationActiveResult {
+export function deactivateCodexIntegration(options: { forRuntimeRecovery?: boolean } = {}): SetCodexIntegrationActiveResult {
   const existing = readJournal();
   if (!existing) return { changed: false, active: false };
   if (existing.version === 2) {
@@ -356,6 +362,11 @@ export function deactivateCodexIntegration(): SetCodexIntegrationActiveResult {
   const current = readFileSync(existing.configPath, "utf8");
   if ((existing.version === 4 || existing.version === 5 || existing.version === 6 || existing.version === 7 || existing.version === 8 || existing.version === 9 || existing.version === 10) && !existing.active) {
     verifyRestoredRoute(current, existing);
+    // An explicit disconnect also cancels a pending recovery, without touching the route.
+    if (!options.forRuntimeRecovery && existing.reconnectOnStartup) {
+      const { reconnectOnStartup: _recovery, ...disconnected } = existing;
+      writeIntegrationState(disconnected, { path: existing.configPath, data: current }, []);
+    }
     return { changed: false, active: false };
   }
   const restored = restoreManagedRoute(current, existing);
@@ -370,11 +381,13 @@ export function deactivateCodexIntegration(): SetCodexIntegrationActiveResult {
       || existing.version === 7 || existing.version === 8 || existing.version === 9 || existing.version === 10
       ? { ...existing, active: false }
       : { ...existing, version: 4, active: false };
+  if (options.forRuntimeRecovery) disconnected.reconnectOnStartup = true;
+  else delete disconnected.reconnectOnStartup;
   writeIntegrationState(disconnected, { path: existing.configPath, data: restored }, [getCodexModelsCachePath()]);
   return { changed: true, active: false };
 }
 
-export function activateCodexIntegration(): SetCodexIntegrationActiveResult {
+export function activateCodexIntegration(options: { recoveryOnly?: boolean } = {}): SetCodexIntegrationActiveResult {
   const existing = readJournal();
   if (!existing) throw new Error("Codex integration is not installed");
   if (existing.version === 2) {
@@ -390,6 +403,7 @@ export function activateCodexIntegration(): SetCodexIntegrationActiveResult {
   let baseline: string;
   if ((existing.version === 4 || existing.version === 5 || existing.version === 6 || existing.version === 7 || existing.version === 8 || existing.version === 9 || existing.version === 10) && !existing.active) {
     verifyRestoredRoute(current, existing);
+    if (options.recoveryOnly && !existing.reconnectOnStartup) return { changed: false, active: false };
     baseline = current;
   } else {
     verifyInstalledRoute(current, existing);

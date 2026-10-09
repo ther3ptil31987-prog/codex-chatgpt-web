@@ -50,7 +50,12 @@ export interface InstalledCodexInterruptHook {
   fragment: string;
 }
 
-export interface CodexIntegrationJournal {
+interface RouteRecoveryState {
+  /** Present only when the launcher disconnected an active route after runtime failure. */
+  reconnectOnStartup?: true;
+}
+
+export interface CodexIntegrationJournal extends RouteRecoveryState {
   version: 10;
   active: boolean;
   configPath: string;
@@ -72,7 +77,7 @@ export interface CodexIntegrationJournal {
   };
 }
 
-export interface LegacyCodexIntegrationJournalV9 {
+export interface LegacyCodexIntegrationJournalV9 extends RouteRecoveryState {
   version: 9;
   active: boolean;
   configPath: string;
@@ -93,7 +98,7 @@ export interface LegacyCodexIntegrationJournalV9 {
   };
 }
 
-export interface LegacyCodexIntegrationJournalV8 {
+export interface LegacyCodexIntegrationJournalV8 extends RouteRecoveryState {
   version: 8;
   active: boolean;
   configPath: string;
@@ -112,7 +117,7 @@ export interface LegacyCodexIntegrationJournalV8 {
   };
 }
 
-export interface LegacyCodexIntegrationJournalV7 {
+export interface LegacyCodexIntegrationJournalV7 extends RouteRecoveryState {
   version: 7;
   active: boolean;
   configPath: string;
@@ -126,7 +131,7 @@ export interface LegacyCodexIntegrationJournalV7 {
   };
 }
 
-export interface LegacyCodexIntegrationJournalV6 {
+export interface LegacyCodexIntegrationJournalV6 extends RouteRecoveryState {
   version: 6;
   active: boolean;
   configPath: string;
@@ -146,7 +151,7 @@ export interface LegacyCodexIntegrationJournalV6 {
   };
 }
 
-export interface LegacyCodexIntegrationJournalV5 {
+export interface LegacyCodexIntegrationJournalV5 extends RouteRecoveryState {
   version: 5;
   active: boolean;
   configPath: string;
@@ -164,7 +169,7 @@ export interface LegacyCodexIntegrationJournalV5 {
   };
 }
 
-export interface LegacyCodexIntegrationJournalV4 {
+export interface LegacyCodexIntegrationJournalV4 extends RouteRecoveryState {
   version: 4;
   active: boolean;
   configPath: string;
@@ -178,7 +183,7 @@ export interface LegacyCodexIntegrationJournalV4 {
   };
 }
 
-export interface LegacyCodexIntegrationJournalV3 {
+export interface LegacyCodexIntegrationJournalV3 extends RouteRecoveryState {
   version: 3;
   configPath: string;
   installed: {
@@ -227,6 +232,7 @@ export interface FileSnapshot {
 
 export interface InstallCodexIntegrationOptions {
   replaceExistingRoute?: boolean;
+  preserveDisconnectedRoute?: boolean;
 }
 
 export interface UninstallCodexIntegrationResult {

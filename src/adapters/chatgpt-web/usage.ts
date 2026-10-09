@@ -3,7 +3,7 @@ import { estimateTokens } from "../../lib/token-estimate";
 import {
   CHATGPT_WEB_BACKEND_MODEL,
   CHATGPT_WEB_BIGGER_CONTEXT_MULTIPLIER,
-  CHATGPT_WEB_LUNA_BIGGER_CONTEXT_ERROR,
+  CHATGPT_WEB_PLATFORM_RESERVE_TOKENS,
   isChatGptWebZeroRiskBackendModel,
   resolveChatGptWebContextLimits,
   resolveChatGptWebMessageTokenBudget,
@@ -54,9 +54,9 @@ export function estimateChatGptWebInputTokens(
     {
       ...options,
       ...(manual ? { manualControl: true as const } : {}),
-      captureLunaCheckpoint: parsed.modelId === CHATGPT_WEB_LUNA_MODEL_ID
+      captureLunaCheckpoint: options.captureLunaCheckpoint ?? (parsed.modelId === CHATGPT_WEB_LUNA_MODEL_ID
         && !parsed._compactionRequest
-        && Boolean(identity.threadId && identity.turnId),
+        && Boolean(identity.threadId && identity.turnId)),
     },
   );
   return estimateCompiledChatGptWebInputTokens(compiled, parsed.modelId);
@@ -75,38 +75,38 @@ export function resolveBiggerContextMultipartParts(
   if (isChatGptWebZeroRiskBackendModel(parsed.modelId)) {
     throw new Error("Bigger Context is unavailable for ChatGPT Zero Risk");
   }
-  if (parsed.modelId === CHATGPT_WEB_LUNA_MODEL_ID) {
-    throw new Error(CHATGPT_WEB_LUNA_BIGGER_CONTEXT_ERROR);
-  }
   const mode = resolveChatGptWebModelMode(parsed.modelId, parsed.options.reasoning, capabilities);
   if (!supportsChatGptWebBiggerContext(parsed.modelId, mode.effort, capabilities, parsed._chatgptModelFamily)) return undefined;
   if (parsed._compactionRequest) return CHATGPT_BIGGER_CONTEXT_PARTS;
-  const { contextWindow, autoCompactTokenLimit } = resolveChatGptWebContextLimits(
-    CHATGPT_WEB_BACKEND_MODEL,
+  const backendModel = parsed.modelId === CHATGPT_WEB_LUNA_MODEL_ID ? CHATGPT_WEB_LUNA_MODEL_ID : CHATGPT_WEB_BACKEND_MODEL;
+  const { autoCompactTokenLimit } = resolveChatGptWebContextLimits(
+    backendModel,
     mode.effort,
     { ...capabilities, experimentalBiggerContext: false },
   );
+  const contextWindow = resolveChatGptWebMessageTokenBudget(backendModel, mode.effort, capabilities)
+    + CHATGPT_WEB_PLATFORM_RESERVE_TOKENS + 1;
   const compile = (parts?: ChatGptWebMultipartPartCount): CompiledChatGptWebPrompt => compileChatGptWebPrompt(
     parsed, capabilities, mode.localTools ? ESTIMATE_TURN_TOKEN : undefined,
-    { experimentalMultipartParts: parts, experimentalSkillAttachments },
+    { experimentalMultipartParts: parts, experimentalSkillAttachments, captureLunaCheckpoint: false },
   );
   const inline = compile();
   const inputTokens = estimateCompiledChatGptWebInputTokens(inline, parsed.modelId);
-  const initialParts = biggerContextPartCount(inputTokens, autoCompactTokenLimit, false);
+  const initialParts = biggerContextPartCount(inputTokens, Math.min(contextWindow, autoCompactTokenLimit), false);
   if (initialParts === CHATGPT_BIGGER_CONTEXT_PARTS) return initialParts;
 
   const fits = (compiled: CompiledChatGptWebPrompt): boolean => {
     const messages = compiledChatGptWebMessages(compiled);
     // Inert stages may use any explicitly available staging effort; execution keeps the chosen
     // effort. These are the widest stage modes used by the browser's existing selector.
-    const stagingEffort = capabilities.proAvailable ? "max" : "medium";
+    const stagingEffort = backendModel === CHATGPT_WEB_LUNA_MODEL_ID ? "low" : capabilities.proAvailable ? "max" : "medium";
     for (const [index, text] of messages.entries()) {
       const final = index === messages.length - 1;
       const effort = final ? mode.effort : stagingEffort;
-      const { browserComposerCharLimit } = resolveChatGptWebTransportLimits(CHATGPT_WEB_BACKEND_MODEL, effort, capabilities);
+      const { browserComposerCharLimit } = resolveChatGptWebTransportLimits(backendModel, effort, capabilities);
       if (browserComposerCharLimit !== undefined && text.length > browserComposerCharLimit) return false;
       const budget = resolveChatGptWebMessageTokenBudget(
-        CHATGPT_WEB_BACKEND_MODEL, effort, capabilities, final ? estimateChatGptWebImageTokens(compiled) + skillFileTokens(compiled.skillFiles, parsed.modelId) : 0,
+        backendModel, effort, capabilities, final ? estimateChatGptWebImageTokens(compiled) + skillFileTokens(compiled.skillFiles, parsed.modelId) : 0,
       );
       if (estimateTokens(text, parsed.modelId) > budget) return false;
     }
@@ -152,6 +152,7 @@ export function estimateChatGptWebUsage(
   experimentalSkillAttachments = false,
 ): CodexUsage {
   const inputTokens = estimateChatGptWebInputTokens(parsed, capabilities, {
+    ...(experimentalBiggerContext ? { captureLunaCheckpoint: false } : {}),
     experimentalSkillAttachments,
     experimentalMultipartParts: experimentalBiggerContext
       ? resolveBiggerContextMultipartParts(parsed, capabilities, experimentalSkillAttachments)

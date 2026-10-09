@@ -368,7 +368,9 @@ describe("ChatGPT outer-native harness v4", () => {
     }
   });
 
-  test.each([false, true])("sequential native messages honor fresh conversation mode=%s", async freshConversation => {
+  test.each([
+    [false, false], [true, false], [false, true], [true, true],
+  ])("sequential native messages honor fresh conversation=%s and Luna Bigger Context=%s", async (freshConversation, luna) => {
     const socketPath = brokerTestEndpoint(`cgw-retained-messages-${process.pid}-${Date.now()}`);
     const provider: CodexProviderConfig = {
       adapter: "chatgpt-web",
@@ -379,7 +381,8 @@ describe("ChatGPT outer-native harness v4", () => {
         experimentalFreshConversationPerTurn: freshConversation,
         brokerSocketPath: socketPath,
         localToolsEnabled: true,
-        solAvailable: true,
+        solAvailable: !luna,
+        experimentalBiggerContext: luna,
         extraHighAvailable: true, proAvailable: true,
       },
     };
@@ -394,6 +397,7 @@ describe("ChatGPT outer-native harness v4", () => {
         expect(turn.prepareResume).toBeUndefined();
         expect(turn.retainConversation).not.toBe(true);
       }
+      expect(turn.captureLunaCheckpoint).toBeUndefined();
       const prepared = browserMessages === 0 || freshConversation ? await turn.prepare() : await turn.prepareResume!();
       preparedPrompts.push(prepared.text);
       conversationKeys.push(turn.conversationKey!);
@@ -414,6 +418,10 @@ describe("ChatGPT outer-native harness v4", () => {
       { role: "assistant", content: [{ type: "text", text: "First retained answer" }], timestamp: 3 },
       { role: "user", content: "Continue in the same repository", timestamp: 4 },
     ];
+    if (luna) {
+      first.modelId = second.modelId = "gpt-5.6-luna";
+      first.options.reasoning = second.options.reasoning = "low";
+    }
     const firstRaw = first._rawBody as { input: unknown[] };
     second._rawBody = {
       prompt_cache_key: "thread_test_123",
@@ -1361,16 +1369,20 @@ describe("ChatGPT outer-native harness v4", () => {
     const originalRun = worker.run.bind(worker);
     (worker as unknown as { run: (turn: BrowserTurn) => Promise<string> }).run = async turn => {
       await turn.prepare();
-      throw new Error("Invalid Luna multipart preparation unexpectedly succeeded");
+      throw new Error("Oversized final contract unexpectedly succeeded");
     };
     try {
       const request = rawWireRequest(environmentXml);
       request.modelId = "gpt-5.6-luna";
       request.options.reasoning = "low";
+      request.options.outputFormat = { type: "json_schema", name: "oversized", strict: true,
+        schema: { type: "string", description: "word ".repeat(25_000) } };
       const events: AdapterEvent[] = [];
-      await expect(createChatGptWebAdapter(provider).runTurn!(
+      await createChatGptWebAdapter(provider).runTurn!(
         request, { headers: new Headers() }, event => events.push(event),
-      )).rejects.toThrow("Bigger Context is unavailable for Luna");
+      );
+      expect(events.at(-1)).toMatchObject({ type: "error", code: "context_length_exceeded", retryable: false });
+      expect((events.at(-1) as { message: string }).message).toContain("exceed the available message budget");
       expect(events.some(event => event.type === "tool_call_start")).toBeFalse();
     } finally {
       (worker as unknown as { run: (turn: BrowserTurn) => Promise<string> }).run = originalRun;
@@ -2213,6 +2225,35 @@ describe("ChatGPT outer-native harness v4", () => {
     await broker.close();
   });
 
+  test("tool diagnostics record the result error flag without treating quoted errors as new failures", async () => {
+    const socketPath = brokerTestEndpoint(`cgw-result-status-${process.pid}-${Date.now()}`);
+    const broker = TurnBroker.forSocket(socketPath);
+    const logs: string[] = [];
+    const logger = spyOn(console, "info").mockImplementation((...args) => { logs.push(args.join(" ")); });
+    try {
+      const token = await broker.register(extractChatGptTurnEnvironment(parsed(environmentXml)), 10_000, "result-status");
+      const { bindingId } = await callTurnBroker<{ bindingId: string }>(socketPath, { method: "claim", token });
+      for (const isError of [undefined, false, true]) {
+        const invocation = callTurnBroker<BrokerToolResult>(socketPath, {
+          method: "invoke", bindingId, wireName: "exec_command", freeform: false,
+          arguments: { cmd: "cat private-history.log" },
+        }, 10_000);
+        const [request] = await broker.nextToolBatch(token);
+        const result: BrokerToolResult = { content: [{ type: "text", text: "private historical safety refusal" }],
+          ...(isError === undefined ? {} : { isError }) };
+        broker.completeTool(token, request!.callId, result);
+        expect(await invocation).toEqual(result);
+        expect(logs.at(-1)).toBe(`[chatgpt-web] broker trace=result-status completed call=${request!.callId.slice(0, 17)} pending=0 isError=${isError === true}`);
+      }
+      for (const value of [token, bindingId, "private-history.log", "private historical safety refusal"]) {
+        expect(logs.join("\n")).not.toContain(value);
+      }
+    } finally {
+      logger.mockRestore();
+      await broker.close();
+    }
+  });
+
   test("commits browser completion only across an unchanged broker activity fence", async () => {
     const socketPath = brokerTestEndpoint(`cgw-h3-terminal-fence-${process.pid}-${Date.now()}`);
     const broker = TurnBroker.forSocket(socketPath);
@@ -2430,6 +2471,33 @@ describe("ChatGPT outer-native harness v4", () => {
       expect(finalDone).toMatchObject({ type: "done", stopReason: "stop", endTurn: true });
       expect(finalDone.usage!.inputTokens).toBeGreaterThan(95_000);
       expect(finalDone.usage!.inputTokens).toBeGreaterThan(firstDone.usage!.inputTokens + 50_000);
+    } finally {
+      (worker as unknown as { run: (turn: BrowserTurn) => Promise<string> }).run = originalRun;
+      await TurnBroker.forSocket(socketPath).close();
+    }
+  });
+
+  test("compaction preserves the original send failure without claiming success or enabling retries", async () => {
+    const socketPath = brokerTestEndpoint(`cgw-compaction-cause-${process.pid}-${Date.now()}`);
+    const provider: CodexProviderConfig = {
+      adapter: "chatgpt-web", baseUrl: `browser://compaction-cause-${Date.now()}`,
+      chatgptWeb: {
+        browserHost: "launcher", browserHostDescriptorPath: join(tempRoot, "compaction-cause-launcher.json"),
+        brokerSocketPath: socketPath, localToolsEnabled: true, solAvailable: true,
+        extraHighAvailable: true, proAvailable: true, experimentalFreshConversationPerTurn: true,
+      },
+    };
+    const worker = ChatGptBrowserWorker.forProvider(provider);
+    const originalRun = worker.run.bind(worker);
+    const failure = new Error("ChatGPT browser stage timed out: send");
+    (worker as unknown as { run: (turn: BrowserTurn) => Promise<string> }).run = async () => { throw failure; };
+    try {
+      const request = { ...rawWireRequest(environmentXml), _compactionRequest: true };
+      const events: AdapterEvent[] = [];
+      await createChatGptWebAdapter(provider).runTurn!(request, { headers: new Headers() }, event => events.push(event));
+      expect(events.at(-1)).toMatchObject({ type: "error", code: "compaction_handoff_failed", retryable: false });
+      expect((events.at(-1) as { message: string }).message).toContain(failure.message);
+      expect(events.some(event => event.type === "text_delta" || event.type === "done")).toBeFalse();
     } finally {
       (worker as unknown as { run: (turn: BrowserTurn) => Promise<string> }).run = originalRun;
       await TurnBroker.forSocket(socketPath).close();

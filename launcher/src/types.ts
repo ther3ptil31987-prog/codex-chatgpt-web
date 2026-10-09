@@ -42,6 +42,7 @@ export interface BrowserState {
   url: string;
   title: string;
   authenticated: boolean;
+  passkeyPhase?: "opening" | "waiting" | "importing" | null;
   visible: boolean;
   surfaceActive: boolean;
   loading: boolean;

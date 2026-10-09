@@ -1386,6 +1386,65 @@ test("explicit login waits for an in-flight saved-session refresh before taking 
   assert.deepEqual(calls, ["ChatGPT login", "probe", "inspect"]);
 });
 
+test("choosing passkey during embedded sign-in switches the owned operation instead of swallowing the click", async () => {
+  let finishCapture, opened;
+  const capture = new Promise(resolve => { finishCapture = resolve; });
+  const ready = new Promise(resolve => { opened = resolve; });
+  let captures = 0;
+  const fixture = Object.assign(Object.create(BrowserHost.prototype), {
+    state: { authenticated: false }, manualOperation: null, loginOperation: null,
+    turnTabs: new Map(), ready: async () => {}, activateHomeSurface() {}, show() {}, hide() {},
+    view: { webContents: { isDestroyed: () => false, setBackgroundThrottling() {},
+      getURL: () => "https://chatgpt.com/?temporary-chat=true" } },
+    logger: { info() {} }, setState(patch) { Object.assign(this.state, patch); },
+    snapshot() { return { ...this.state }; },
+    probeAuthentication: async () => ({ authenticated: false }),
+    loginWithPasskey: async onProgress => {
+      captures++;
+      onProgress("waiting");
+      opened();
+      await capture;
+      return { storageState: {} };
+    },
+    installPasskeyLogin: async () => { fixture.setState({ authenticated: true, status: "ready" }); },
+  });
+  const embedded = fixture.openLogin();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(fixture.manualOperation, "ChatGPT login");
+  const passkey = fixture.openPasskeyLogin();
+  assert.equal(passkey, embedded);
+  await ready;
+  assert.equal(captures, 1);
+  assert.equal(fixture.manualOperation, "ChatGPT passkey login");
+  assert.equal(fixture.state.passkeyPhase, "waiting");
+  assert.equal(fixture.openPasskeyLogin(), passkey);
+  finishCapture();
+  const result = await passkey;
+  assert.equal(result.authenticated, true);
+  assert.equal(result.passkeyPhase, null);
+  assert.equal(fixture.manualOperation, null);
+  assert.equal(fixture.loginOperation, null);
+  assert.equal(fixture.loginMode, null);
+});
+
+test("failed passkey launch clears its progress and releases the browser operation", async () => {
+  const fixture = Object.assign(Object.create(BrowserHost.prototype), {
+    state: { authenticated: false }, turnTabs: new Map(),
+    ready: async () => {}, activateHomeSurface() {}, hide() {},
+    view: { webContents: { isDestroyed: () => false, setBackgroundThrottling() {} } },
+    logger: { info() {} }, setState(patch) { Object.assign(this.state, patch); },
+    snapshot() { return { ...this.state }; },
+    loginWithPasskey: async () => { throw new Error("Chrome could not start"); },
+  });
+  await assert.rejects(fixture.openPasskeyLogin(), /Chrome could not start/);
+  assert.equal(fixture.state.passkeyPhase, null);
+  assert.equal(fixture.state.loading, false);
+  assert.equal(fixture.state.status, "error");
+  assert.equal(fixture.state.authenticated, false);
+  assert.equal(fixture.manualOperation, null);
+  assert.equal(fixture.loginOperation, null);
+});
+
 test("passkey login imports only validated state and re-proves the Launcher session", async () => {
   const calls = [];
   const browserSession = {
@@ -3083,13 +3142,18 @@ test("a completed connector turn without binding is released instead of retained
   assert.equal(closed, true);
 });
 
-test("failed and aborted browser turns release their tab slots", async () => {
-  for (const status of ["failed", "aborted"]) {
+test("aborted, uninitialized and signed-out browser turns release their tab slots", async () => {
+  for (const [status, bootstrapReady, authenticationRequired] of [
+    ["aborted", true, false], ["failed", false, false], ["failed", true, true],
+  ]) {
     let closed = false;
     const tab = {
       id: `tab-${status}`,
       traceId: `trace_${status}`,
       helperPid: 777,
+      interactionMode: "automatic",
+      bootstrapReady,
+      authenticationRequired,
       status: "running",
       loading: true,
       view: { webContents: {
@@ -3126,6 +3190,96 @@ test("failed and aborted browser turns release their tab slots", async () => {
     assert.equal(tab.status, status === "aborted" ? "aborted" : "error");
     assert.equal(closed, true);
   }
+});
+
+function failedAutomaticTurnFixture() {
+  const closed = [];
+  const tab = {
+    id: "failed-tab", traceId: "failed-trace", helperPid: 777,
+    status: "running", interactionMode: "automatic", bootstrapReady: true,
+    conversationKey: "f".repeat(64), connectorIdentity: "Codex Native2", connectorBound: true,
+    approvalPending: true, turnProgress: { stage: "chatgpt", activeToolCalls: 0 },
+    view: { webContents: {
+      isDestroyed: () => false, setBackgroundThrottling() {}, close: () => closed.push(tab.id),
+    } },
+  };
+  const fixture = Object.assign(Object.create(BrowserHost.prototype), {
+    turnTabs: new Map([[tab.id, tab]]), userCancelledTurnOwners: new Map(), closedTurnOwners: new Map(),
+    selectedTabId: tab.id, manualOperation: null,
+    window: { contentView: { removeChildView() {} } },
+    syncViewVisibility() {}, writeDescriptor() {}, publishState() {}, snapshot: () => ({ tabs: [] }),
+    hide() { throw new Error("do not hide the failed page the user is inspecting"); },
+    logger: { info() {} },
+    createTurnTab: async (traceId, helperPid, conversationKey, connectorIdentity) => {
+      const fresh = { id: "fresh-tab", surfaceId: "fresh-surface", traceId, helperPid,
+        conversationKey, connectorIdentity, status: "running", interactionMode: "automatic" };
+      fixture.turnTabs.set(fresh.id, fresh);
+      return fresh;
+    },
+  });
+  return { fixture, tab, closed };
+}
+
+test("failed ChatGPT pages remain inspectable but lose turn ownership and cannot become successful", async () => {
+  const { fixture, tab, closed } = failedAutomaticTurnFixture();
+  assert.deepEqual(await fixture.endTurn(tab.traceId, tab.helperPid, "failed", true, "Check the ChatGPT tab"),
+    { cancelledByUser: false });
+  assert.equal(fixture.turnTabs.get(tab.id), tab);
+  assert.equal(fixture.selectedTabId, tab.id);
+  assert.equal(tab.status, "error");
+  assert.equal(tab.message, "Check the ChatGPT tab");
+  assert.equal(tab.approvalPending, false);
+  assert.equal(tab.turnProgress, undefined);
+  assert.equal(tab.connectorBound, false);
+  assert.equal(fixture.activeTraceId, null);
+  assert.throws(() => fixture.heartbeatTurn(tab.traceId, tab.helperPid), /no longer running/);
+  assert.throws(() => fixture.setTurnApprovalPending(tab.traceId, tab.helperPid, true), /no longer running/);
+  await assert.rejects(() => fixture.endTurn(tab.traceId, 778, "failed", true), /helper ownership mismatch/);
+  await assert.rejects(() => fixture.endTurn(tab.traceId, tab.helperPid, "completed", true, undefined, true, true),
+    /already failed/);
+  const failedAt = tab.failedAt;
+  await fixture.endTurn(tab.traceId, tab.helperPid, "failed", true);
+  assert.equal(tab.failedAt, failedAt, "repeated end notifications cannot extend retention");
+  assert.deepEqual(closed, []);
+
+  fixture.lastTurnSweepAt = failedAt + 30 * 60_000 - 2;
+  await fixture.reapExpiredTurnTabs(failedAt + 30 * 60_000 - 1);
+  assert.equal(fixture.turnTabs.get(tab.id), tab, "helper liveness is irrelevant to a terminal page");
+  await fixture.reapExpiredTurnTabs(failedAt + 30 * 60_000);
+  assert.deepEqual(closed, [tab.id]);
+  assert.equal(fixture.turnTabs.size, 0);
+});
+
+test("failed pages cannot supply retained history and a same-trace retry gets a fresh document", async () => {
+  const { fixture, tab, closed } = failedAutomaticTurnFixture();
+  await fixture.endTurn(tab.traceId, tab.helperPid, "failed", false);
+  for (const traceId of [tab.traceId, "next-trace"]) {
+    await assert.rejects(() => fixture.beginTurn(traceId, false, 778, tab.conversationKey, tab.connectorIdentity, true),
+      error => error.code === "retained_conversation_unavailable");
+  }
+  assert.deepEqual(closed, []);
+  const next = await fixture.beginTurn("next-trace", false, 778, tab.conversationKey, tab.connectorIdentity);
+  assert.equal(next.reused, false);
+  assert.equal(fixture.turnTabs.get(tab.id), tab, "another turn does not immediately erase failure evidence");
+  fixture.turnTabs.delete(next.tabId);
+  const retry = await fixture.beginTurn(tab.traceId, false, 778, tab.conversationKey, tab.connectorIdentity);
+  assert.equal(retry.reused, false);
+  assert.notEqual(retry.tabId, tab.id);
+  assert.deepEqual(closed, [tab.id]);
+  assert.equal([...fixture.turnTabs.values()].filter(item => item.traceId === tab.traceId).length, 1);
+});
+
+test("failed pages free capacity before reusable conversations without evicting active error states", async () => {
+  const { fixture, tab, closed } = failedAutomaticTurnFixture();
+  await fixture.endTurn(tab.traceId, tab.helperPid, "failed", false);
+  const reusable = { id: "reusable", status: "ready", lastHeartbeatAt: 1 };
+  const activeError = { id: "active-error", status: "error", interactionMode: "automatic", lastHeartbeatAt: 1 };
+  fixture.turnTabs.set(reusable.id, reusable);
+  fixture.turnTabs.set(activeError.id, activeError);
+  assert.equal(fixture.evictOldestReclaimableTurnTab(), true);
+  assert.deepEqual(closed, [tab.id]);
+  assert.equal(fixture.turnTabs.get(reusable.id), reusable);
+  assert.equal(fixture.turnTabs.get(activeError.id), activeError);
 });
 
 function manualTurnFixture() {

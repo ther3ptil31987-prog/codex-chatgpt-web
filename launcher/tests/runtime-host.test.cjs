@@ -192,11 +192,11 @@ test("Bigger Context uses the setup transaction and refreshes the production Cod
   });
 });
 
-test("Luna cannot enable Bigger Context, but can turn off an existing unsupported setting", async () => {
+test("Luna can enable and disable Bigger Context in production and DEV", async () => {
   for (const createHost of [hostFor, devHostFor]) {
     const fixture = createHost({ mode: "browser-only", solAvailable: false, experimentalBiggerContext: true });
-    await assert.rejects(fixture.host.setBiggerContext(true), /unavailable for Luna and Think/);
-    assert.equal(fixture.invocation(), undefined);
+    assert.equal((await fixture.host.setBiggerContext(true)).enabled, true);
+    assert.ok(fixture.invocation().args.includes("--bigger-context"));
     const result = await fixture.host.setBiggerContext(false);
     assert.equal(result.enabled, false);
     assert.ok(fixture.invocation().args.includes("--standard-context"));
@@ -395,6 +395,7 @@ test("launcher update transaction upgrades its owned full runtime with saved con
     "--automatic-browser-interaction",
     "--acknowledge-unofficial",
     "--restart-service",
+    "--preserve-disconnected-route",
   ]);
   assert.deepEqual(result, {
     updated: true,
@@ -467,6 +468,7 @@ test("launcher migrates the legacy connector identity even when the release vers
     "--automatic-browser-interaction",
     "--acknowledge-unofficial",
     "--restart-service",
+    "--preserve-disconnected-route",
   ]);
   assert.equal(result.updated, true);
   assert.equal(result.connectorMigrated, true);
@@ -594,7 +596,7 @@ test("mutating launcher operations are serialized before lifecycle changes begin
   assert.equal(fixture.invocation(), undefined);
 });
 
-function bridgeFixture({ active }) {
+function bridgeFixture({ active, recovery = false }) {
   const calls = [];
   let routeActive = active;
   const supervisor = {
@@ -620,14 +622,16 @@ function bridgeFixture({ active }) {
     const action = args.join(" ");
     calls.push(action);
     if (action === "route status") {
-      return { stdout: JSON.stringify({ installed: true, active: routeActive, errors: [] }) };
+      return { stdout: JSON.stringify({ installed: true, active: routeActive, reconnectOnStartup: recovery, errors: [] }) };
     }
-    if (action === "route connect") {
+    if (action === "route connect" || action === "route recover") {
       routeActive = true;
+      recovery = false;
       return { stdout: JSON.stringify({ changed: true, active: true }) };
     }
-    if (action === "route disconnect") {
+    if (action === "route disconnect" || action === "route disconnect --for-runtime-recovery") {
       routeActive = false;
+      recovery = action.endsWith("--for-runtime-recovery");
       return { stdout: JSON.stringify({ changed: true, active: false }) };
     }
     throw new Error(`Unexpected command: ${action}`);
@@ -667,7 +671,7 @@ test("startup recovery can restore the Codex route without requiring a healthy l
   const fixture = bridgeFixture({ active: true });
   const result = await fixture.host.restoreBridgeRoute("runtime-start-fail-safe");
   assert.equal(result.active, false);
-  assert.deepEqual(fixture.calls, ["route status", "route disconnect", "route status"]);
+  assert.deepEqual(fixture.calls, ["route status", "route disconnect --for-runtime-recovery", "route status"]);
 });
 
 test("failed runtime cleanup during removal still restores the previous Codex route", async () => {
@@ -1282,8 +1286,11 @@ test("macOS passkey capture uses an isolated launcher-controlled transfer", asyn
   }
   host.launcherControlEnvironment = () => ({ CODEX_WEB_GPT_LAUNCHER_CONTROL_TOKEN: "token" });
   let invocation;
+  const phases = [];
   host.run = async (name, args, options) => {
     invocation = { name, args, options };
+    options.onStdoutLine("Opening Chrome");
+    options.onStdoutLine(JSON.stringify({ version: 1, type: "passkey-login-ready" }));
     const statePath = args[args.indexOf("--storage-state") + 1];
     fs.writeFileSync(statePath, `${JSON.stringify({ cookies: [], origins: [] })}\n`, { mode: 0o600 });
     fs.writeFileSync(`${statePath}.verified.json`, `${JSON.stringify({
@@ -1295,7 +1302,9 @@ test("macOS passkey capture uses an isolated launcher-controlled transfer", asyn
     return { code: 0, stdout: "", stderr: "" };
   };
   try {
-    const transfer = await host.capturePasskeyLogin();
+    const transfer = await host.capturePasskeyLogin(phase => phases.push(phase));
+    assert.deepEqual(phases, ["opening", "waiting"]);
+    assert.equal(host.passkeyPhase, null);
     assert.deepEqual(transfer.storageState, { cookies: [], origins: [] });
     assert.equal(invocation.name, "passkey-login");
     assert.deepEqual(invocation.args.slice(0, 4), ["login", "--launcher-control", "--chrome", chrome]);
@@ -1315,6 +1324,7 @@ test("passkey Continue is delivered only to the active owned login child", async
   const fixture = hostFor(null).host;
   let written = "";
   fixture.active = "passkey-login";
+  fixture.passkeyPhase = "opening";
   fixture.activeChild = {
     exitCode: null,
     signalCode: null,
@@ -1326,7 +1336,13 @@ test("passkey Continue is delivered only to the active owned login child", async
       },
     },
   };
+  assert.throws(() => fixture.continuePasskeyLogin(), /No passkey sign-in is waiting/);
+  assert.equal(written, "");
+  fixture.passkeyPhase = "waiting";
+  const phases = [];
+  fixture.passkeyProgress = phase => phases.push(phase);
   assert.equal(await fixture.continuePasskeyLogin(), true);
+  assert.deepEqual(phases, ["importing"]);
   assert.deepEqual(JSON.parse(written), { version: 1, type: "passkey-login-continue" });
   assert.throws(() => fixture.continuePasskeyLogin(), /No passkey sign-in is waiting/);
 });
@@ -1460,4 +1476,23 @@ test("renaming rolls back the saved name if the new runtime fails", async () => 
   await assert.rejects(host.setConnectorNameSuffix("New"), /fixture failure/);
   assert.equal(config.automaticAppName, "Codex Old");
   assert.equal(config.appName, "Codex Old");
+});
+
+
+test("automatic startup reconnects only a route disconnected for runtime recovery", async () => {
+  for (const recovery of [false, true]) {
+    const fixture = bridgeFixture({ active: false, recovery });
+    const result = await fixture.host.connectBridgeRoute({ recoveryOnly: true });
+    assert.equal(result.active, recovery);
+    assert.deepEqual(fixture.calls, recovery ? ["route status", "route recover", "route status"] : ["route status"]);
+  }
+});
+
+test("explicit removal cancels pending recovery even when the route is already inactive", async () => {
+  const fixture = bridgeFixture({ active: false, recovery: true });
+  await fixture.host.restoreBridgeRoute("uninstall-integration");
+  assert.deepEqual(fixture.calls, ["route status", "route disconnect", "route status"]);
+  const result = await fixture.host.connectBridgeRoute({ recoveryOnly: true });
+  assert.equal(result.active, false);
+  assert.equal(fixture.calls.at(-1), "route status");
 });

@@ -454,7 +454,7 @@ export class TurnBroker implements TurnBrokerOwner {
       throw new Error(`tool call was completed before it was delivered: ${callId}`);
     }
     channel.invocations.delete(callId);
-    console.info(`[chatgpt-web] broker trace=${channel.traceId} completed call=${callId.slice(0, 17)} pending=${channel.invocations.size}`);
+    console.info(`[chatgpt-web] broker trace=${channel.traceId} completed call=${callId.slice(0, 17)} pending=${channel.invocations.size} isError=${result.isError === true}`);
     invocation.resolve(result);
   }
 
@@ -778,7 +778,7 @@ export class TurnBroker implements TurnBrokerOwner {
 
   private start(): Promise<void> {
     if (this.startPromise) return this.startPromise;
-    this.startPromise = new Promise<void>((resolveStart, rejectStart) => {
+    const attempt = new Promise<void>((resolveStart, rejectStart) => {
       const windowsPipe = isWindowsPipeEndpoint(this.socketPath);
       if (!windowsPipe) {
         // sun_path is a fixed-size field in the kernel, so an over-long path fails inside listen()
@@ -870,7 +870,16 @@ export class TurnBroker implements TurnBrokerOwner {
         });
       });
     });
-    return this.startPromise;
+    this.startPromise = attempt;
+    // The daemon keeps serving after a failed startup bind, and the previous owner can release the
+    // endpoint moments later. Forget the failed attempt so the next turn probes again instead of
+    // inheriting a startup error for the rest of the process lifetime.
+    attempt.catch(() => {
+      if (this.startPromise !== attempt) return;
+      this.startPromise = undefined;
+      if (this.server && !this.server.listening) this.server = undefined;
+    });
+    return attempt;
   }
 
   private handleSocket(socket: Socket): void {

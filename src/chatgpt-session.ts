@@ -29,6 +29,16 @@ export const CHATGPT_EFFORT_SLIDER_CONTAINER_SELECTOR = '[data-model-reasoning-e
 export const CHATGPT_EFFORT_SLIDER_SELECTOR = '[data-model-reasoning-effort-slider] [role="slider"], [data-model-picker-power-slider] [role="slider"]';
 export const CHATGPT_EFFORT_SLIDER_MAX_OPTIONS = 5;
 
+/** Model identity precedes the localized slider position; punctuation is not language-specific. */
+export function parseChatGptModelAnnouncement(text: string): {
+  version: string; name?: string; mode: string;
+} | undefined {
+  const normalized = text.normalize("NFKC").replace(/\p{Cf}/gu, "").replace(/\s+/g, " ").trim();
+  const match = /^(?:GPT[-\s]?)?(\d+(?:\.\d+)?)(?:\s+(Sol|Astra))?\s+([^\p{P}]+)(?:\p{P}|$)/iu.exec(normalized);
+  if (!match) return undefined;
+  return { version: match[1]!, ...(match[2] ? { name: match[2].toLowerCase() } : {}), mode: match[3]!.trim() };
+}
+
 /** Read model evidence only from the slider's own active picker. */
 export async function readChatGptModelAnnouncements(slider: Locator): Promise<string[]> {
   return slider.evaluate(element => {

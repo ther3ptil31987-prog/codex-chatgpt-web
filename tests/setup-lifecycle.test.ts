@@ -9,12 +9,28 @@ import * as tunnel from "../src/tunnel";
 import * as tunnelService from "../src/tunnel-service";
 import * as browserHost from "../src/launcher-browser-host";
 import * as browserLogin from "../src/browser-login";
-import { launcherCapabilityProbeRequired, setup, setupDevProfile, setupProxyIsReady } from "../src/setup";
+import { launcherCapabilityProbeRequired, portBindFailureMessage, setup, setupDevProfile, setupProxyIsReady } from "../src/setup";
 
 const config = {
   mode: "browser-only" as const,
   releaseVersion: "0.2.0",
 };
+
+// #712: after a restart Windows can reserve the bridge port; Node reports that as EACCES.
+test("Windows EACCES suggests checks without claiming a port reservation is proven", () => {
+  const reserved = Object.assign(new Error("listen EACCES: permission denied 127.0.0.1:17841"), { code: "EACCES" });
+  const busy = Object.assign(new Error("listen EADDRINUSE: address already in use 127.0.0.1:17841"), { code: "EADDRINUSE" });
+  const plain = "Cannot bind 127.0.0.1:17841: listen EACCES: permission denied 127.0.0.1:17841";
+
+  const explained = portBindFailureMessage("127.0.0.1", 17841, reserved, "win32");
+  expect(explained.startsWith(`${plain}. Windows may have reserved this port`)).toBeTrue();
+  expect(explained).toContain("another service may hold it exclusively");
+  expect(explained).toContain("TROUBLESHOOTING.md");
+  // Elsewhere EACCES is a real permission error, and a busy port has its own owner to find.
+  expect(portBindFailureMessage("127.0.0.1", 17841, reserved, "linux")).toBe(plain);
+  expect(portBindFailureMessage("127.0.0.1", 17841, busy, "win32"))
+    .toBe("Cannot bind 127.0.0.1:17841: listen EADDRINUSE: address already in use 127.0.0.1:17841");
+});
 
 test("setup accepts only a matching daemon that is ready for new Codex turns", () => {
   const ready = {
@@ -172,7 +188,7 @@ for (const development of [false, true]) for (const interaction of ["manual", "a
 }
 
 for (const development of [false, true]) {
-  test(`${development ? "DEV" : "production"} rejects Luna Bigger Context without changing config and accepts explicitly disabling it`, async () => {
+  test(`${development ? "DEV" : "production"} allows Luna Bigger Context and preserves it across account refresh`, async () => {
     const root = mkdtempSync(join(tmpdir(), "codex-web-luna-setup-"));
     const configPath = join(root, "config.json");
     const existing = {
@@ -203,13 +219,14 @@ for (const development of [false, true]) {
       const options = { mode: "browser-only" as const, subagentProtocol: "native" as const, port,
         browserHostDescriptorPath: join(root, "launcher-browser.json"), acknowledgedUnofficial: true };
       const configure = development ? setupDevProfile : setup;
-      await expect(configure(options)).rejects.toThrow("Turn it off in launcher Settings");
-      await expect(configure({ ...options, experimentalBiggerContext: true })).rejects.toThrow("unavailable for Luna and Think");
-      // Refreshing a previously paid account must validate the newly observed capability.
+      await configure(options);
+      expect(save.mock.calls.at(-1)?.[0]).toMatchObject({ solAvailable: false, experimentalBiggerContext: true });
+      await configure({ ...options, experimentalBiggerContext: true });
+      expect(save.mock.calls.at(-1)?.[0]).toMatchObject({ solAvailable: false, experimentalBiggerContext: true });
+      // Refreshing a previously paid account preserves the explicitly enabled feature on Free.
       existing.solAvailable = true;
-      await expect(configure({ ...options, refreshAccountCapabilities: true })).rejects.toThrow("--standard-context");
-      expect(save).not.toHaveBeenCalled();
-      expect(integrate).not.toHaveBeenCalled();
+      await configure({ ...options, refreshAccountCapabilities: true });
+      expect(save.mock.calls.at(-1)?.[0]).toMatchObject({ solAvailable: false, experimentalBiggerContext: true });
       existing.solAvailable = false;
       await configure({ ...options, experimentalBiggerContext: false });
       expect(save.mock.calls.at(-1)?.[0]).toMatchObject({ solAvailable: false, experimentalBiggerContext: false });

@@ -375,6 +375,7 @@ class BrowserHost {
     this.selectedTabId = "home";
     this.manualOperation = null;
     this.loginOperation = null;
+    this.loginMode = null;
     this.sessionRefreshOperation = null;
     this.authenticationRevision = 0;
     this.reauthenticationRequired = false;
@@ -764,13 +765,13 @@ class BrowserHost {
   }
 
   evictOldestReclaimableTurnTab() {
-    const terminalManual = [...this.turnTabs.values()]
-      .filter(tab => tab.interactionMode === "manual"
+    const terminal = [...this.turnTabs.values()]
+      .filter(tab => tab.failedAt !== undefined || (tab.interactionMode === "manual"
         && tab.status === "error"
-        && ["timed-out", "failed", "cancelled"].includes(tab.manualState))
+        && ["timed-out", "failed", "cancelled"].includes(tab.manualState)))
       .sort((left, right) => (left.lastHeartbeatAt ?? 0) - (right.lastHeartbeatAt ?? 0))[0];
-    if (terminalManual) {
-      this.removeTurnTab(terminalManual, false);
+    if (terminal) {
+      this.removeTurnTab(terminal, false);
       return true;
     }
     return BrowserHost.prototype.evictOldestRetainedTurnTab.call(this);
@@ -1531,6 +1532,12 @@ class BrowserHost {
       return;
     }
     for (const tab of [...this.turnTabs.values()]) {
+      if (tab.failedAt !== undefined) {
+        if (now - tab.failedAt < RETAINED_TURN_TAB_TTL_MS) continue;
+        this.logger.info("browser.failed_tab_expired", { tabId: tab.id, traceId: tab.traceId });
+        this.removeTurnTab(tab, false);
+        continue;
+      }
       if (tab.interactionMode === "manual") {
         if (tab.status === "ready") {
           if (now - (tab.lastHeartbeatAt ?? 0) < RETAINED_TURN_TAB_TTL_MS) continue;
@@ -2465,7 +2472,7 @@ class BrowserHost {
       || sameTrace.connectorIdentity !== connectorIdentity)) {
       throw new Error(`ChatGPT browser turn ${traceId} conversation metadata does not match its owned tab`);
     }
-    const retainedMatches = conversationKey ? [...this.turnTabs.values()].filter((tab) => (
+    const retainedMatches = conversationKey && sameTrace?.failedAt === undefined ? [...this.turnTabs.values()].filter((tab) => (
       tab.interactionMode === "automatic"
       && tab.status === "ready"
       && tab.conversationKey === conversationKey
@@ -2528,6 +2535,8 @@ class BrowserHost {
       error.code = "retained_conversation_unavailable";
       throw error;
     }
+    // A retry may reuse the trace, but never the failed document or its incremental history.
+    if (sameTrace?.failedAt !== undefined) this.removeTurnTab(sameTrace, false);
     const tab = await this.createTurnTab(traceId, helperPid, conversationKey, connectorIdentity, signal);
     this.selectedTabId = tab.id;
     if (reveal) this.show();
@@ -2563,6 +2572,10 @@ class BrowserHost {
       );
     }
     const cancelledByUser = this.userCancelledTurnOwners.get(traceId) === helperPid;
+    if (tab.failedAt !== undefined) {
+      if (status !== "failed") throw new Error(`Browser turn ${traceId} already failed`);
+      return { cancelledByUser };
+    }
     const authenticationRequired = tab.authenticationRequired === true;
     if (authenticationRequired && status === "completed") status = "failed";
     tab.status = status === "completed" ? "ready" : status === "aborted" ? "aborted" : "error";
@@ -2584,6 +2597,18 @@ class BrowserHost {
       tab.lastHeartbeatAt = Date.now();
       if (hideAfterTurn && !this.activeTraceId) this.hide();
       this.logger.info("browser.tab_retained", { tabId: tab.id, traceId });
+      this.publishState?.(this.snapshot());
+      this.writeDescriptor();
+      return { cancelledByUser };
+    }
+    if (status === "failed" && tab.interactionMode === "automatic" && tab.bootstrapReady === true
+      && !authenticationRequired && !cancelledByUser && !tab.view.webContents.isDestroyed()) {
+      // Preserve the page the error asks the user to inspect. This is a terminal document, not a
+      // retained conversation: heartbeats and reuse reject it, and the runtime retires its tools.
+      // Reclaim it before reusable conversations when slots are needed, or after the normal TTL.
+      tab.failedAt = tab.lastHeartbeatAt = Date.now();
+      tab.connectorBound = false;
+      this.logger.info("browser.failed_tab_preserved", { tabId: tab.id, traceId });
       this.publishState?.(this.snapshot());
       this.writeDescriptor();
       return { cancelledByUser };
@@ -2616,10 +2641,13 @@ class BrowserHost {
       return Promise.resolve(this.snapshot());
     }
     if (this.loginOperation) {
-      this.activateHomeSurface();
-      this.show();
+      if (this.loginMode !== "passkey") {
+        this.activateHomeSurface();
+        this.show();
+      }
       return this.loginOperation;
     }
+    this.loginMode = "embedded";
     const operation = (async () => {
       const sessionRefresh = this.sessionRefreshOperation;
       if (sessionRefresh) {
@@ -2630,6 +2658,7 @@ class BrowserHost {
         }
       }
       return await this.withManualOperation("ChatGPT login", async () => {
+        if (this.loginMode === "passkey") return this.runPasskeyLogin();
         this.authNavigationError = null;
         this.show();
         this.logger.info("browser.login_opened");
@@ -2638,13 +2667,18 @@ class BrowserHost {
           await this.view.webContents.loadURL(TEMPORARY_CHAT_URL);
         }
         await this.probeAuthentication();
-        const authenticated = await this.waitForAuthenticated();
+        const authenticated = await this.waitForAuthenticated(180_000, () => this.loginMode === "passkey");
+        if (authenticated === null) return this.runPasskeyLogin();
         await this.runSessionInspection(false);
         return authenticated;
       });
     })();
     const tracked = operation.finally(() => {
-      if (this.loginOperation === tracked) this.loginOperation = null;
+      if (this.loginOperation === tracked) {
+        this.loginOperation = null;
+        this.loginMode = null;
+        if (this.state.passkeyPhase) this.setState({ passkeyPhase: null, loading: false });
+      }
     });
     this.loginOperation = tracked;
     return tracked;
@@ -2657,7 +2691,15 @@ class BrowserHost {
       this.show();
       return Promise.resolve(this.snapshot());
     }
-    if (this.loginOperation) return this.loginOperation;
+    if (this.loginOperation) {
+      if (this.loginMode === "embedded") {
+        this.loginMode = "passkey";
+        this.setState({ passkeyPhase: "opening" });
+      }
+      return this.loginOperation;
+    }
+    this.loginMode = "passkey";
+    this.setState({ passkeyPhase: "opening" });
     const operation = (async () => {
       const sessionRefresh = this.sessionRefreshOperation;
       if (sessionRefresh) {
@@ -2667,24 +2709,33 @@ class BrowserHost {
           // Explicit sign-in is the recovery path after a failed saved-session refresh.
         }
       }
-      return await this.withManualOperation("ChatGPT passkey login", async () => {
-        this.authNavigationError = null;
-        this.setState({
-          authenticated: false,
-          status: "loading",
-          message: "Waiting for passkey sign-in in Chrome",
-          loading: true,
-        });
-        this.logger.info("browser.passkey_login_started");
-        const transfer = await this.loginWithPasskey();
-        return await this.installPasskeyLogin(transfer);
-      });
+      return await this.withManualOperation("ChatGPT passkey login", () => this.runPasskeyLogin());
     })();
     const tracked = operation.finally(() => {
-      if (this.loginOperation === tracked) this.loginOperation = null;
+      if (this.loginOperation === tracked) {
+        this.loginOperation = null;
+        this.loginMode = null;
+        this.setState({ passkeyPhase: null, loading: false });
+      }
     });
     this.loginOperation = tracked;
     return tracked;
+  }
+
+  async runPasskeyLogin() {
+    // Switching from embedded sign-in retains the same exclusive browser operation.
+    this.manualOperation = "ChatGPT passkey login";
+    this.authNavigationError = null;
+    if (this.authView) this.closeAuthView(this.authView, true, false);
+    this.hide();
+    this.setState({ authenticated: false, status: "loading", passkeyPhase: "opening",
+      message: "Opening Chrome for passkey sign-in", loading: true });
+    this.logger.info("browser.passkey_login_started");
+    const transfer = await this.loginWithPasskey(passkeyPhase => this.setState({ passkeyPhase }));
+    this.setState({ passkeyPhase: "importing" });
+    await this.installPasskeyLogin(transfer);
+    this.setState({ passkeyPhase: null, loading: false });
+    return this.snapshot();
   }
 
   async clearOwnedSessionForPasskey() {
@@ -2949,9 +3000,10 @@ class BrowserHost {
     return tracked;
   }
 
-  async waitForAuthenticated(timeoutMs = 180_000) {
+  async waitForAuthenticated(timeoutMs = 180_000, switchToPasskey = () => false) {
     const deadline = Date.now() + timeoutMs;
     while (Date.now() < deadline) {
+      if (switchToPasskey()) return null;
       if (this.primaryNavigationError) throw this.primaryNavigationError;
       if (this.authNavigationError) {
         const error = this.authNavigationError;

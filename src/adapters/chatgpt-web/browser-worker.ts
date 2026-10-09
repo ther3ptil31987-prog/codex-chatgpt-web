@@ -32,7 +32,6 @@ import {
   type ChatGptWebModelMode,
 } from "./model";
 import {
-  CHATGPT_LUNA_BROWSER_INPUT_TOKEN_BUDGET,
   compiledChatGptWebMaxMessageChars,
   estimateChatGptWebImageTokens,
   estimateCompiledChatGptWebMessageTokens,
@@ -75,6 +74,8 @@ import {
   notifyLauncherTurn,
 } from "../../launcher-browser-host";
 import {
+  CHATGPT_LUNA_BROWSER_INPUT_TOKEN_BUDGET,
+  CHATGPT_WEB_PLATFORM_RESERVE_TOKENS,
   CHATGPT_WEB_GPT6_SOL_BIGGER_CONTEXT_ERROR,
   resolveChatGptWebContextLimits,
   resolveChatGptWebMessageTokenBudget,
@@ -1087,23 +1088,14 @@ export function assertChatGptWebMultipartInputWithinLimits(
   if (!isChatGptWebMultipartPartCount(partCount)) {
     throw new Error("Bigger Context requires two or six context parts");
   }
-  if (modelId === CHATGPT_WEB_LUNA_MODEL_ID) {
-    throw new ChatGptWebAdapterError(
-      "Bigger Context is unavailable for Luna because every later browser request includes the accumulated transcript inside the same 28,000-token transport budget.",
-      { status: 400, errorType: "invalid_request_error", code: "context_length_exceeded", retryable: false },
-    );
-  }
-  if (modelId !== CHATGPT_WEB_MODEL_ID) {
+  if (modelId !== CHATGPT_WEB_MODEL_ID && modelId !== CHATGPT_WEB_LUNA_MODEL_ID) {
     throw new Error(`ChatGPT Bigger Context limit is not defined for model: ${modelId}`);
   }
   if (!supportsChatGptWebBiggerContext(modelId, effort, capabilities, modelFamily)) {
     throw new Error(CHATGPT_WEB_GPT6_SOL_BIGGER_CONTEXT_ERROR);
   }
-  const { contextWindow: baseContextWindow } = resolveChatGptWebContextLimits(
-    modelId,
-    effort,
-    { ...capabilities, experimentalBiggerContext: false },
-  );
+  const baseContextWindow = resolveChatGptWebMessageTokenBudget(modelId, effort, capabilities)
+    + CHATGPT_WEB_PLATFORM_RESERVE_TOKENS + 1;
   const assertMessageBoundary = (
     label: "stage" | "final part",
     messageTokens: number,
@@ -1175,16 +1167,10 @@ export function resolveChatGptWebMultipartStagingMode(
   maxStageMessageTokens: number,
   maxStageChars: number,
 ): ChatGptWebModelMode {
-  if (modelId === CHATGPT_WEB_LUNA_MODEL_ID || !capabilities.solAvailable) {
-    throw new ChatGptWebAdapterError(
-      "Bigger Context staging is unavailable for a Luna-only account.",
-      { status: 400, errorType: "invalid_request_error", code: "context_length_exceeded", retryable: false },
-    );
-  }
-  if (modelId !== CHATGPT_WEB_MODEL_ID) {
+  if (modelId !== CHATGPT_WEB_MODEL_ID && modelId !== CHATGPT_WEB_LUNA_MODEL_ID) {
     throw new Error(`ChatGPT Bigger Context staging mode is not defined for model: ${modelId}`);
   }
-  const efforts: readonly ChatGptWebModelMode["effort"][] = capabilities.proAvailable
+  const efforts: readonly ChatGptWebModelMode["effort"][] = modelId === CHATGPT_WEB_LUNA_MODEL_ID ? ["low"] : capabilities.proAvailable
     ? ["low", "medium", "max"]
     : ["low", "medium"];
   for (const effort of efforts) {
@@ -3358,7 +3344,9 @@ export class ChatGptBrowserWorker {
     return composer.evaluate(element => {
       const clone = element.cloneNode(true) as HTMLElement;
       clone.querySelectorAll(
-        '[data-id^="plugin:"][data-keyword], [data-inline-selection-pill-cursor-target], [app-mention-path^="app://"][app-mention-display-name][contenteditable="false"]',
+        // Read message content, not icon titles, embedded CSS or scripts. Literal
+        // markup stays as text, and arbitrary non-editable content is still checked.
+        'svg, style, script, [data-id^="plugin:"][data-keyword], [data-inline-selection-pill-cursor-target], [app-mention-path^="app://"][app-mention-display-name][contenteditable="false"]',
       )
         .forEach(part => part.remove());
       return [...clone.childNodes]
@@ -4384,11 +4372,13 @@ export class ChatGptBrowserWorker {
         // #769 captured a resource preview changing its title to filename/type after
         // surrounding prose was already delivered. This is a presentation control,
         // not answer text. Preserve cards that expose an actual link destination.
-        for (const card of Array.from(content.querySelectorAll(
-          '[data-chatgpt-copy-reference][data-markdown-copy="contents"]',
-        ))) {
+        const referenceSelector = '[data-chatgpt-copy-reference][data-markdown-copy="contents"]';
+        for (const card of [content, ...Array.from(content.querySelectorAll(referenceSelector))]
+          .filter(node => node.matches(referenceSelector) && !node.closest("pre, code"))) {
           if (card.querySelector('[class~="group/resource-row"]') && !card.querySelector("a[href]")) {
-            card.remove();
+            // Keep the reference boundary even when its current view has no answer
+            // content: a download link may replace this preview on a later frame.
+            card.textContent = "";
           }
         }
         // These are embedded renderers, not Markdown answer text. Their loading labels, controls
@@ -4439,6 +4429,7 @@ export class ChatGptBrowserWorker {
         html: string;
         text: string;
         pendingLinks: boolean;
+        mutableReference: boolean;
         linkTargets: string[];
         group?: string;
         sourceStart?: number;
@@ -4500,12 +4491,14 @@ export class ChatGptBrowserWorker {
           ? { sourceStart, sourceEnd }
           : undefined;
       };
-      const linkState = (element: HTMLElement): { pendingLinks: boolean; linkTargets: string[] } => {
+      const linkState = (element: HTMLElement): { pendingLinks: boolean; linkTargets: string[]; mutableReference: boolean } => {
         // ChatGPT may paint a link label before supplying its destination. An append-only
         // response cannot add that destination back after committing the label as plain text.
         const anchors = [element, ...element.querySelectorAll<HTMLElement>("a")]
           .filter(candidate => candidate.tagName === "A" && Boolean(candidate.textContent?.trim()));
         return {
+          mutableReference: [element, ...element.querySelectorAll('[data-chatgpt-copy-reference][data-markdown-copy="contents"]')]
+            .some(node => node.matches('[data-chatgpt-copy-reference][data-markdown-copy="contents"]') && !node.closest("pre, code")),
           pendingLinks: anchors.some(candidate => !candidate.getAttribute("href")?.trim()),
           linkTargets: anchors.flatMap(candidate => {
             const href = candidate.getAttribute("href");
@@ -4553,11 +4546,12 @@ export class ChatGptBrowserWorker {
           });
         });
       };
-      renderedRoots.map(root => chatGptMarkdownContent(root, rememberClone)).forEach((markdownRoot) => {
+      const answerContentRoots = renderedRoots.map(root => chatGptMarkdownContent(root, rememberClone));
+      answerContentRoots.forEach((markdownRoot) => {
         const children = [...markdownRoot.children] as HTMLElement[];
         const hasBlockChildren = children.some(child => blockMarkdownTags.has(child.tagName.toLowerCase()));
         if (!hasBlockChildren) {
-          if (markdownRoot.innerHTML.trim()) flattenedMarkdownSegments.push({
+          if (markdownRoot.innerHTML.trim() || linkState(markdownRoot).mutableReference) flattenedMarkdownSegments.push({
             nodeKey: nodeKey(markdownRoot),
             tag: "root",
             html: markdownRoot.innerHTML,
@@ -4576,7 +4570,7 @@ export class ChatGptBrowserWorker {
           const shell = document.createElement("span");
           nodes.forEach(node => shell.append(node.cloneNode(true)));
           const text = markdownText(shell);
-          if (text) {
+          if (text || linkState(shell).mutableReference) {
             const rangedElements = nodes.flatMap(node => node instanceof Element
               ? [node, ...node.querySelectorAll<HTMLElement>("[data-start][data-end]")]
               : []);
@@ -4608,9 +4602,9 @@ export class ChatGptBrowserWorker {
         flushInlineRun();
       });
       const markdownSegments = flattenedMarkdownSegments.map((segment, index, segments) => ({
-        key: segment.sourceStart !== undefined
-          ? `${segment.sourceStart}:${segment.tag}`
-          : `${segment.nodeKey}:${segment.tag}`,
+        // Source offsets may arrive after this exact node has already streamed. Keep its
+        // DOM identity as well; the buffer independently uses ranges across later remounts.
+        key: `${segment.nodeKey}:${segment.tag}`,
         tag: segment.tag,
         html: segment.html,
         text: segment.text,
@@ -4618,6 +4612,7 @@ export class ChatGptBrowserWorker {
         ...(segment.sourceStart !== undefined ? { sourceStart: segment.sourceStart } : {}),
         ...(segment.sourceEnd !== undefined ? { sourceEnd: segment.sourceEnd } : {}),
         streamable: index < segments.length - 1 && !segment.pendingLinks,
+        ...(segment.mutableReference ? { mutableReference: true } : {}),
         linkTargets: segment.linkTargets,
       }));
       const rendered = renderedRoots.at(-1);
@@ -4763,8 +4758,10 @@ export class ChatGptBrowserWorker {
         key: observerKey,
         snapshot: {
           responsePresent: true,
-          visibleText: renderedRoots.map(candidate => candidate.innerText.trim()).filter(Boolean).join("\n\n"),
-          fullHtml: renderedRoots.map(candidate => candidate.innerHTML).join(""),
+          // Completion and tool-progress checks must observe the same answer as delivery.
+          // Chart animation, preview loading and copy controls are not new model output.
+          visibleText: answerContentRoots.map(markdownText).filter(Boolean).join("\n\n"),
+          fullHtml: answerContentRoots.map(candidate => candidate.innerHTML).join(""),
           markdownSegments,
           completionActionVisible: completionAction !== undefined,
           stoppedThinkingVisible,

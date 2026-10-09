@@ -1211,6 +1211,53 @@ test("active composer resolution waits for exactly one visible editor", async ()
   expect(await activeComposer.call({}, page, 500)).toBe(composer);
 });
 
+test("composer verification ignores icon markup while preserving the exact prompt and live editor", async () => {
+  const { createWindow } = require("@mixmark-io/domino");
+  const links = Array.from({ length: 6 }, (_, index) => `https://drive.google.com/file/d/example-${index}`);
+  const icon = '<svg><title>Drive</title><desc>File icon</desc><style>@supports (color:color(display-p3 1 1 1)){}</style>  <g><path d="M0 0"/></g></svg>';
+  const literal = '<svg><text>Keep this code</text></svg> <style>body { color: red }</style> <script>example()</script>';
+  const window = createWindow('<div id="composer"><p></p><p></p><p></p><p></p></div>');
+  const composer = window.document.getElementById("composer");
+  const paragraphs = composer.children;
+  paragraphs[0].innerHTML = '<span data-id="plugin:example" data-keyword="Codex Native2">Codex Native2</span>'
+    + '<span data-inline-selection-pill-cursor-target>\u200b</span>'
+    + links.map(url => `<a href="${url}"><span contenteditable="false">${icon}</span>${url}</a>`).join(" ");
+  paragraphs[1].textContent = literal;
+  paragraphs[3].innerHTML = '  Keep  two spaces, 日本語 and <span contenteditable="false">ordinary rich text</span>.';
+  // Non-rendering style/script nodes can also occur outside the icon itself.
+  for (const tag of ["style", "script"]) {
+    const decoration = window.document.createElement(tag);
+    decoration.textContent = "not prompt text";
+    composer.appendChild(decoration);
+  }
+  const expected = `${links.join(" ")}\n${literal}\n\n  Keep  two spaces, 日本語 and ordinary rich text.`;
+  const original = composer.innerHTML;
+  const worker = Object.assign(Object.create(ChatGptBrowserWorker.prototype), {
+    activeComposer: async () => ({ evaluate: async (callback: Function) => callback(composer) }),
+  }) as {
+    attachedPromptText(page: unknown): Promise<string>;
+    assertPromptAttached(page: unknown, prompt: string): Promise<void>;
+    promptTextEquivalent(expected: string, observed: string): boolean;
+  };
+  expect(await worker.attachedPromptText({})).toBe(expected);
+  await expect(worker.assertPromptAttached({}, expected)).resolves.toBeUndefined();
+  expect(composer.innerHTML).toBe(original);
+  expect(composer.querySelectorAll("svg").length).toBe(6);
+
+  // Decorations are ignored; a changed URL, missing text or extra ordinary
+  // non-editable content must still fail the existing integrity comparison.
+  for (const [variant, mutate] of [
+    () => { composer.querySelector("a").lastChild.textContent += "/changed"; },
+    () => { composer.querySelectorAll("p")[1].textContent = literal.slice(0, -1); },
+    () => { composer.querySelectorAll("p")[3].querySelector("span").textContent += " unexpected"; },
+  ].entries()) {
+    composer.innerHTML = original;
+    mutate();
+    expect({ variant, equivalent: worker.promptTextEquivalent(expected, await worker.attachedPromptText({})) })
+      .toEqual({ variant, equivalent: false });
+  }
+});
+
 test("prompt verification accepts Lexical NBSP preservation without weakening other mismatches", async () => {
   // Lexical may preserve indentation as alternating NBSP and ASCII spaces while keeping the same
   // UTF-16 length; that representation is equivalent only for whitespace runs.
@@ -3652,7 +3699,7 @@ test("Bigger Context preflight expands only the total context ceiling and keeps 
     { localToolsEnabled: false, solAvailable: false, extraHighAvailable: false, proAvailable: false },
     40_000,
     2,
-  )).toThrow("unavailable for Luna");
+  )).not.toThrow();
 });
 
 test("Bigger Context stages use the lowest account mode that can carry the stage", () => {
@@ -3688,12 +3735,12 @@ test("Bigger Context stages use the lowest account mode that can carry the stage
   expect(resolveChatGptWebMultipartStagingMode("gpt-5.6-sol", pro, 100_000, 500_000).effort).toBe("low");
   expect(resolveChatGptWebMultipartStagingMode("gpt-5.6-sol", pro, 100_000, 600_000).effort).toBe("max");
   expect(resolveChatGptWebMultipartStagingMode("gpt-5.6-sol", pro, 104_000, 1_200_000).effort).toBe("max");
-  expect(() => resolveChatGptWebMultipartStagingMode(
+  expect(resolveChatGptWebMultipartStagingMode(
     "gpt-5.6-luna",
     { localToolsEnabled: false, solAvailable: false, extraHighAvailable: false, proAvailable: false },
     10_000,
     20_000,
-  )).toThrow("Luna-only");
+  ).effort).toBe("low");
   expect(() => assertChatGptWebMultipartInputWithinLimits(
     100_000,
     30_000,
