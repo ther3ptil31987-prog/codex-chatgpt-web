@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { selectedSkillFile, skillFileTokens, type ChatGptSkillFile } from "./skill-attachments";
 import {
-  CHATGPT_WEB_GPT6_SOL_BIGGER_CONTEXT_ERROR,
+  CHATGPT_WEB_GPT6_INSTANT_BIGGER_CONTEXT_ERROR,
   chatGptWebImageTokenReserve,
   isChatGptWebZeroRiskBackendModel,
   resolveChatGptWebMessageTokenBudget,
@@ -159,11 +159,15 @@ const RETIRED_TURN_HANDLE = /(?<![A-Za-z0-9_-])(turn|request|binding)_[A-Za-z0-9
  * the current turn is supplied by the contract text, never by the replayed context.
  */
 export function withoutRetiredTurnHandles(contextJson: string): string {
+  // Keep backticks out of serialized history. ChatGPT's user-message Markdown link lexer
+  // can backtrack indefinitely on a bracketed JSON value containing many code fences.
+  // JSON Unicode escapes preserve the decoded context, including literal backslashes.
+  // The outer fence alone is insufficient on the observed user-message rendering path.
   // Match decoded string values: in serialized JSON a newline's `n` is a word character
   // immediately before the handle. Leave structural keys and native tool-call IDs intact.
   return JSON.stringify(JSON.parse(contextJson, (_key, value: unknown) => typeof value === "string"
     ? value.replace(RETIRED_TURN_HANDLE, (_handle, kind: string) => `[retired ${kind} handle]`)
-    : value));
+    : value)).replaceAll("`", "\\u0060");
 }
 
 /** ChatGPT accepts at most this many attachments on one message. */
@@ -461,8 +465,8 @@ export function compileChatGptWebPrompt(
   if (multipartEnabled && captureLunaCheckpoint) {
     throw new Error("Bigger Context uses native compaction, not Luna rolling checkpoints");
   }
-  if (multipartEnabled && !supportsChatGptWebBiggerContext(parsed.modelId, mode.effort, capabilities, parsed._chatgptModelFamily)) {
-    throw new Error(CHATGPT_WEB_GPT6_SOL_BIGGER_CONTEXT_ERROR);
+  if (multipartEnabled && !supportsChatGptWebBiggerContext(parsed.modelId, mode.effort, parsed._chatgptModelFamily)) {
+    throw new Error(CHATGPT_WEB_GPT6_INSTANT_BIGGER_CONTEXT_ERROR);
   }
   if (parsed.modelId === CHATGPT_WEB_LUNA_MODEL_ID && parsed._compactionRequest && !multipartEnabled) {
     throw new Error("ChatGPT Luna uses rolling checkpoints and does not accept a separate compaction turn");
