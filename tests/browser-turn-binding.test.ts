@@ -1,8 +1,28 @@
 import { expect, test } from "bun:test";
 import { chromium, type Locator, type Page } from "playwright-core";
 import { ChatGptBrowserWorker } from "../src/adapters/chatgpt-web/browser-worker";
-import { ChatGptMarkdownBuffer } from "../src/adapters/chatgpt-web/markdown";
+import { chatGptHtmlToMarkdown, ChatGptMarkdownBuffer } from "../src/adapters/chatgpt-web/markdown";
 import { readFileSync } from "node:fs";
+
+test.skipIf(!process.env.CHATGPT_DOM_TEST_BROWSER)("CodeMirror language invalidates the response cache and incomplete code is not delivered", async () => {
+  const browser = await chromium.launch({ executablePath: process.env.CHATGPT_DOM_TEST_BROWSER, headless: true });
+  try {
+    const page = await browser.newPage();
+    await page.setContent(readFileSync(new URL("./fixtures/chatgpt-codemirror-reply-2026-10-11.html", import.meta.url), "utf8"));
+    const worker = Object.create(ChatGptBrowserWorker.prototype) as any;
+    const cache = {};
+    const observe = () => worker.responseDomSnapshot(page.locator("#turn"), cache);
+    expect(chatGptHtmlToMarkdown((await observe()).fullHtml)).toContain("```python\nprint(1)\n```");
+    await page.locator(".cm-content").evaluate(editor => editor.setAttribute("data-language", "text"));
+    expect(chatGptHtmlToMarkdown((await observe()).fullHtml)).toContain("```text\nprint(1)\n```");
+    await page.locator(".cm-content").evaluate(editor => {
+      const gap = document.createElement("div");
+      gap.style.height = "200px";
+      editor.appendChild(gap);
+    });
+    await expect(observe()).rejects.toThrow("one complete set of code lines");
+  } finally { await browser.close(); }
+});
 
 test.skipIf(!process.env.CHATGPT_DOM_TEST_BROWSER)("paragraph identity survives file preview movement in both response layouts", async () => {
   const browser = await chromium.launch({ executablePath: process.env.CHATGPT_DOM_TEST_BROWSER, headless: true });

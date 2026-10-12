@@ -316,6 +316,50 @@ test("reported code-block containers preserve code while their localized toolbar
   }
 });
 
+test("captured CodeMirror reply preserves its language, fences and line boundaries", async () => {
+  const html = readFileSync(new URL("./fixtures/chatgpt-codemirror-reply-2026-10-11.html", import.meta.url), "utf8");
+  const captured = await snapshot(html);
+  expect(chatGptHtmlToMarkdown(captured.fullHtml)).toBe("# Probe\n\n- First item\n- Second item\n\n```python\nprint(1)\n```");
+  const code = 'def sample():\n    value = "日本語 & <x>"\n\n    return value\n';
+  const frames = await snapshots(html, [
+    doc => {
+      const editor = doc.querySelector(".cm-content")!;
+      editor.textContent = "";
+      for (const text of code.split("\n")) {
+        const line = doc.createElement("div"); line.className = "cm-line";
+        if (text) line.textContent = text; else line.appendChild(doc.createElement("br"));
+        editor.appendChild(line);
+      }
+    },
+    doc => { doc.querySelector('[data-markdown-copy="exclude"]')!.textContent = "コード"; },
+  ]);
+  const buffer = new ChatGptMarkdownBuffer(markdown => markdown, 0);
+  buffer.observe(frames[1]!.markdownSegments, 0);
+  buffer.observe(frames[2]!.markdownSegments, 1000);
+  expect(buffer.currentSnapshotIsConsistent()).toBeTrue();
+  expect(buffer.finish().markdown).toBe(`# Probe\n\n- First item\n- Second item\n\n\`\`\`python\n${code}\`\`\``);
+  expect(frames[2]!.fullHtml).not.toContain("コード");
+  expect(frames[2]!.fullHtml).not.toContain("cm-content");
+});
+
+test("CodeMirror source changes remain real answer edits and incomplete editors fail explicitly", async () => {
+  const html = readFileSync(new URL("./fixtures/chatgpt-codemirror-reply-2026-10-11.html", import.meta.url), "utf8");
+  const frames = await snapshots(html, [
+    doc => { doc.querySelector(".cm-line")!.textContent = "print(2)"; },
+  ]);
+  const buffer = new ChatGptMarkdownBuffer(markdown => markdown, 0);
+  buffer.observe(frames[0]!.markdownSegments, 0);
+  buffer.finish();
+  buffer.observe(frames[1]!.markdownSegments, 1000);
+  expect(() => buffer.finish()).toThrow("ChatGPT changed a completed text block");
+  for (const missingSource of [
+    html.replace('<div class="cm-line">', '<div style="height:200px"></div><div class="cm-line">'),
+    html.replace('<div class="cm-line">', '<div class="cm-content" data-language="python"></div><div class="cm-line">'),
+  ]) {
+    await expect(snapshot(missingSource)).rejects.toThrow("one complete set of code lines");
+  }
+});
+
 test("known rich-content controls cannot keep a finished answer waiting, but answer edits restart settling", async () => {
   // Chart and preview boundaries were captured in DEV; their controls can change
   // after generation has stopped. Completion must use the same content as delivery.

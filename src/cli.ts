@@ -82,6 +82,8 @@ Setup options:
   --retained-conversation      Reuse the browser chat between turns (default)
   --saved-chats                Keep task conversations in ChatGPT history
   --temporary-chats            Use Temporary Chat for task conversations (default)
+  --composer-predictions       Enable next-message suggestions using GPT-6 Sol Medium (default)
+  --no-composer-predictions    Disable next-message suggestions for Web models
   --skill-attachments         Experimental selected skills as text attachments
   --inline-skills             Keep selected skills inline (default)
   --standard-context           Disable experimental multi-message context
@@ -308,6 +310,10 @@ async function setupCommand(args: string[]): Promise<void> {
   if (runtimeKeyFile) options.runtimeKeyFile = runtimeKeyFile;
   options.forceLogin = takeFlag(args, "--login");
   options.autoApproveToolCalls = takeFlag(args, "--auto-approve-tool-calls");
+  const predictions = takeFlag(args, "--composer-predictions");
+  const noPredictions = takeFlag(args, "--no-composer-predictions");
+  if (predictions && noPredictions) throw new Error("Choose --composer-predictions or --no-composer-predictions");
+  if (predictions || noPredictions) options.composerPredictionsEnabled = predictions;
   const skillAttachments = takeFlag(args, "--skill-attachments");
   const inlineSkills = takeFlag(args, "--inline-skills");
   if (skillAttachments && inlineSkills) throw new Error("Choose --skill-attachments or --inline-skills");

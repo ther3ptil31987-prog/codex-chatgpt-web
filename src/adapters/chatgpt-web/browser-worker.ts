@@ -1,8 +1,9 @@
 import { randomUUID } from "node:crypto";
-import { chmodSync, existsSync, mkdirSync, readdirSync, rmSync, statSync } from "node:fs";
+import { existsSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { observeChatGptAttachmentUploads } from "./attachment-upload";
-import { chatGptResponseStructures } from "./browser-response-structure";
+import { chatGptResponseStructureLogEntries, chatGptResponseStructures } from "./browser-response-structure";
+import { BrowserDiagnosticHistory } from "./browser-diagnostic-history";
 import { skillFileTokens, validateSkillFiles } from "./skill-attachments";
 import { detectChatGptLimitsPlan, readChatGptUsageAccount, readChatGptUsageModel, supportsChatGptUsageTracking, type ChatGptUsageModel } from "./limits";
 import { chromium, type Browser, type BrowserContext, type Locator, type Page, type Request, type Response } from "playwright-core";
@@ -160,6 +161,7 @@ const CHATGPT_DOM_REVISION_ATTRIBUTES = [
   "class",
   "data-item-anchor",
   "data-is-last-node",
+  "data-language",
   "data-message-author-role",
   "data-state",
   "data-streaming-response-status",
@@ -1491,6 +1493,15 @@ export function chatGptSubmissionEvidence(state: {
   return undefined;
 }
 
+export function chatGptThinkButtons(composer: Locator): Locator {
+  const form = composer.locator("xpath=ancestor::form[1]");
+  // Keep the semantic button used before 6.1.8 alongside the captured localized
+  // glyph. Both identify the same action; never substitute a composer command.
+  return form.locator(CHATGPT_THINK_BUTTON_SELECTOR)
+    .or(form.getByRole("button", { name: "Think", exact: true }))
+    .filter({ visible: true });
+}
+
 export async function setChatGptThinkMode(
   composer: Locator,
   enabled: boolean,
@@ -1498,20 +1509,24 @@ export async function setChatGptThinkMode(
   abortSignal?: AbortSignal,
 ): Promise<void> {
   throwIfPromptAttachmentAborted(abortSignal);
-  const composerForm = composer.locator("xpath=ancestor::form[1]");
-  const controls = composerForm
-    .locator(CHATGPT_THINK_BUTTON_SELECTOR)
-    .filter({ visible: true });
-  const count = await controls.count();
+  const controls = chatGptThinkButtons(composer);
+  let count = await controls.count();
   if (count === 0 && !enabled) {
     await captureDiagnostic?.("luna-default-confirmed");
     return;
   }
+  if (count === 0) {
+    // The editor can mount before its controls. Wait for the actual button;
+    // typing /think here can become a literal prompt or remove the plugin pill.
+    await controls.first().waitFor({ state: "visible", timeout: 5_000, signal: abortSignal });
+    count = await controls.count();
+  }
+  if (count === 0) throw new Error("ChatGPT did not expose a visible Think button");
   if (count > 1) throw new Error(`ChatGPT exposed ${count} visible Think controls`);
   const control = controls.first();
   const actionOptions = { signal: abortSignal, timeout: CHATGPT_CONNECTOR_ACTION_TIMEOUT_MS };
-  let pressed = count === 1 ? await control.getAttribute("aria-pressed", actionOptions) : null;
-  if (count === 1 && pressed !== "true" && pressed !== "false") {
+  let pressed = await control.getAttribute("aria-pressed", actionOptions);
+  if (pressed !== "true" && pressed !== "false") {
     throw new Error("ChatGPT Think control has no semantic pressed state");
   }
   const target = enabled ? "true" : "false";
@@ -1527,31 +1542,7 @@ export async function setChatGptThinkMode(
     }, undefined, actionOptions);
     const before = await composerState();
     if (before.text) throw new Error("ChatGPT Think selection requires an empty prompt draft");
-    if (count === 1) {
-      await control.click(actionOptions);
-    } else {
-      await composer.focus(actionOptions);
-      await composer.press(CHATGPT_COMPOSER_DOCUMENT_END_KEY, actionOptions);
-      await composer.pressSequentially("/think", { ...actionOptions, delay: 25 });
-      await captureDiagnostic?.("think-slash-triggered");
-      // The command popup shares menu-item classes with sidebar history. Count only this popup.
-      const popup = composerForm.page().locator('.popover[aria-busy="false"]').filter({ visible: true });
-      const rows = popup.locator('.__menu-item[tabindex="0"]').filter({ visible: true });
-      await rows.first().waitFor({ state: "visible", timeout: 5_000, signal: abortSignal });
-      if (await popup.count() !== 1 || await rows.count() !== 1) {
-        throw new Error("ChatGPT Think slash menu must expose exactly one command option");
-      }
-      const row = rows.first();
-      if (await row.getAttribute("data-highlighted", actionOptions) === null) {
-        await composer.press("ArrowDown", actionOptions);
-      }
-      if (await row.getAttribute("data-highlighted", actionOptions) === null) {
-        throw new Error("ChatGPT Think slash option is not highlighted");
-      }
-      await captureDiagnostic?.("think-slash-menu-ready");
-      throwIfPromptAttachmentAborted(abortSignal);
-      await composer.press("Enter", actionOptions);
-    }
+    await control.click(actionOptions);
     const deadline = Date.now() + 5_000;
     while (Date.now() < deadline) {
       throwIfPromptAttachmentAborted(abortSignal);
@@ -1920,35 +1911,15 @@ export function sanitizeChatGptBrowserDiagnosticState(value: unknown): unknown {
   }));
 }
 
-const CHATGPT_BROWSER_DIAGNOSTIC_TRACE_LIMIT = 10;
-
 export function browserDiagnosticCheckpoint(value: string): string {
   const safe = value.replace(/[^A-Za-z0-9_-]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 80);
   return safe || "checkpoint";
 }
 
-function privateDirectory(path: string): void {
-  mkdirSync(path, { recursive: true, mode: 0o700 });
-  try { chmodSync(path, 0o700); } catch { /* Windows ACLs are managed by the installer. */ }
-}
-
-function pruneBrowserDiagnostics(root: string): void {
-  const traces = readdirSync(root, { withFileTypes: true })
-    .filter(entry => entry.isDirectory() && /^[A-Za-z0-9_-]{6,128}$/.test(entry.name))
-    .map(entry => {
-      const path = join(root, entry.name);
-      return { path, modifiedAt: statSync(path).mtimeMs };
-    })
-    .sort((left, right) => right.modifiedAt - left.modifiedAt);
-  for (const trace of traces.slice(CHATGPT_BROWSER_DIAGNOSTIC_TRACE_LIMIT)) {
-    rmSync(trace.path, { recursive: true, force: true });
-  }
-}
-
 class ChatGptBrowserDiagnostics {
   private readonly directory: string;
+  private readonly history: BrowserDiagnosticHistory;
   private sequence = 0;
-  private initialized = false;
 
   constructor(
     private readonly traceId: string,
@@ -1959,16 +1930,19 @@ class ChatGptBrowserDiagnostics {
       throw new Error("ChatGPT browser diagnostic trace id is invalid");
     }
     this.directory = join(this.root, `${traceId}-${randomUUID().slice(0, 8)}`);
+    this.history = new BrowserDiagnosticHistory(this.root, this.directory);
+  }
+
+  finish(status: "completed" | "failed"): void {
+    try { this.history.finish(status); }
+    catch (error) {
+      console.warn(`[chatgpt-web] browser diagnostic retention failed trace=${this.traceId}: ${String(error)}`);
+    }
   }
 
   async capture(page: Page, checkpoint: string, error?: unknown): Promise<void> {
     try {
-      if (!this.initialized) {
-        privateDirectory(this.root);
-        privateDirectory(this.directory);
-        pruneBrowserDiagnostics(this.root);
-        this.initialized = true;
-      }
+      this.history.start();
       const sequence = String(++this.sequence).padStart(2, "0");
       const stem = `${sequence}-${browserDiagnosticCheckpoint(checkpoint)}`;
       const includeScreenshot = process.env.CODEX_CHATGPT_WEB_BROWSER_DIAGNOSTICS === "1";
@@ -2179,17 +2153,9 @@ class ChatGptBrowserDiagnostics {
       if (structureResult.status === "fulfilled" && /turn-failed|response-stalled/.test(checkpoint)) {
         // Carry the bounded, content-free tree into Activity → Export safe log as well. The
         // failing renderer may have been replaced by the time the reporter opens its tab.
-        console.info(`[chatgpt-web] response_structure ${JSON.stringify({
-          traceId: this.traceId, checkpoint: stem,
-          columns: ["parent", "tag", "rendered", "assistant", "user", "searchUnit", "markdown", "streamingStatus", "activityStart", "completionControl"],
-          turns: structureResult.value.map(turn => ({
-            truncated: turn.truncated,
-            nodes: turn.nodes.map(node => [node.parent, node.tag, ...[
-              node.rendered, node.assistant, node.user, node.searchUnit, node.markdown,
-              node.streamingStatus, node.activityStart, node.completionControl,
-            ].map(Number)]),
-          })),
-        })}`);
+        for (const entry of chatGptResponseStructureLogEntries(this.traceId, stem, structureResult.value)) {
+          console.info(entry);
+        }
       }
       if (Object.keys(captureErrors).length > 0) {
         console.warn(
@@ -3774,8 +3740,7 @@ export class ChatGptBrowserWorker {
       // attachment owns the selected pill and prompt text as one transaction.
       composerMutationStarted = true;
       if (requireThink) {
-        const controls = selectedComposer.locator("xpath=ancestor::form[1]")
-          .locator(CHATGPT_THINK_BUTTON_SELECTOR).filter({ visible: true });
+        const controls = chatGptThinkButtons(selectedComposer);
         if (await controls.count() !== 1 || await controls.first().getAttribute("aria-pressed", {
           signal: abortSignal, timeout: CHATGPT_CONNECTOR_ACTION_TIMEOUT_MS,
         }) !== "true") {
@@ -3879,15 +3844,33 @@ export class ChatGptBrowserWorker {
     await captureDiagnostic?.("send-ready");
     const initialToolBatchRevision = externalProgress?.snapshot().lastToolBatchRevision ?? 0;
     await submissionLifecycle?.onSendActivated?.();
-    const activationAbort = new AbortController();
+    const sendAbort = new AbortController();
     const sendSignal = abortSignal
-      ? AbortSignal.any([abortSignal, activationAbort.signal])
-      : activationAbort.signal;
+      ? AbortSignal.any([abortSignal, sendAbort.signal])
+      : sendAbort.signal;
+    const activationAbort = new AbortController();
+    const activationSignal = AbortSignal.any([sendSignal, activationAbort.signal]);
+    let activationRetiredForRecovery = false;
     // Enter can already have submitted the prompt while the renderer blocks its command reply.
     // Observe acceptance concurrently; never press again or wait for that reply after proof.
-    const activation = sendButton.press("Enter", { noWaitAfter: true, signal: sendSignal, timeout: 0 });
+    const activation = withBrowserTurnAbort(
+      sendButton.press("Enter", { noWaitAfter: true, signal: activationSignal, timeout: 0 }),
+      activationSignal,
+    ).catch(error => {
+      if (!activationRetiredForRecovery || sendSignal.aborted || !(error instanceof DOMException)
+        || error.name !== "AbortError") throw error;
+    });
     const acceptance = this.waitForSubmissionAcceptedWithRecovery(
-      page, baseline, sendSignal, externalProgress, initialToolBatchRevision, completionTracker, recoverObservation,
+      page, baseline, sendSignal, externalProgress, initialToolBatchRevision, completionTracker,
+      recoverObservation ? async (...args) => {
+        // Same-page recovery intentionally disconnects the old transport. Retire its pending
+        // keypress first, so that disconnect cannot fail the turn while recovery is still running.
+        // Only acceptance evidence from the rebound page can establish success; never press again.
+        activationRetiredForRecovery = true;
+        activationAbort.abort();
+        await activation;
+        return recoverObservation(...args);
+      } : undefined,
     );
     try {
       const evidence = await withBrowserTurnAbort(Promise.race([
@@ -3897,7 +3880,7 @@ export class ChatGptBrowserWorker {
       await submissionLifecycle?.onSubmitted?.();
       return evidence;
     } finally {
-      activationAbort.abort();
+      sendAbort.abort();
     }
   }
 
@@ -4121,6 +4104,7 @@ export class ChatGptBrowserWorker {
       this.config.appName,
     );
     const captureDiagnostic = (checkpoint: string): Promise<void> => diagnostics.capture(page, checkpoint);
+    let completed = false;
     try {
       await captureDiagnostic("connector-verification-started");
       await this.prepareChatSurface(page, captureDiagnostic);
@@ -4134,10 +4118,13 @@ export class ChatGptBrowserWorker {
       await this.clearChatGptComposerState(page);
       await captureDiagnostic("connector-verification-cleared");
       await captureDiagnostic("connector-verification-succeeded");
+      completed = true;
       return this.config.appName;
     } catch (error) {
       await diagnostics.capture(page, "connector-verification-failed", error);
       throw error;
+    } finally {
+      diagnostics.finish(completed ? "completed" : "failed");
     }
   }
 
@@ -4453,8 +4440,27 @@ export class ChatGptBrowserWorker {
         for (const block of Array.from(content.querySelectorAll(codeBlockSelector))) {
           if (block.parentElement?.closest(codeBlockSelector)) continue;
           const codes = block.querySelectorAll("code");
-          if (codes.length !== 1) continue;
-          const code = codes[0]!.cloneNode(true);
+          let code: Node;
+          if (codes.length === 1) {
+            code = codes[0]!.cloneNode(true);
+          } else {
+            // Captured 2026-10-11 (#815): interactive code blocks use CodeMirror
+            // DIV lines instead of CODE/PRE. Read their language and logical lines,
+            // never the localized toolbar or layout-derived wrapped lines.
+            const editors = block.querySelectorAll('.cm-content[data-language]');
+            if (codes.length !== 0 || editors.length === 0) continue;
+            const editor = editors[0]!;
+            const lines = Array.from(editor.children);
+            if (editors.length !== 1 || lines.some(line => !line.matches(".cm-line"))) {
+              const error = new Error("ChatGPT code block does not expose one complete set of code lines");
+              error.name = "ChatGptCodeBlockError";
+              throw error;
+            }
+            const source = content.ownerDocument.createElement("code");
+            source.className = `language-${editor.getAttribute("data-language")}`;
+            source.textContent = lines.map(line => line.textContent ?? "").join("\n");
+            code = source;
+          }
           const pre = block.tagName === "PRE" ? block : content.ownerDocument.createElement("pre");
           block.textContent = "";
           pre.appendChild(code);
@@ -4588,7 +4594,17 @@ export class ChatGptBrowserWorker {
           });
         });
       };
-      const answerContentRoots = renderedRoots.map(root => chatGptMarkdownContent(root, rememberClone));
+      let answerContentRoots: HTMLElement[];
+      try {
+        answerContentRoots = renderedRoots.map(root => chatGptMarkdownContent(root, rememberClone));
+      } catch (error) {
+        // Carry extraction failures as data: Playwright does not preserve custom
+        // page Error names, and a failed DOM probe normally means "not observed".
+        if (error instanceof Error && error.name === "ChatGptCodeBlockError") {
+          return { key: observerKey, extractionError: error.message };
+        }
+        throw error;
+      }
       answerContentRoots.forEach((markdownRoot) => {
         const children = [...markdownRoot.children] as HTMLElement[];
         const hasBlockChildren = children.some(child => blockMarkdownTags.has(child.tagName.toLowerCase()));
@@ -4816,6 +4832,7 @@ export class ChatGptBrowserWorker {
       knownKey: cache?.key,
       attributeFilter: [...CHATGPT_DOM_REVISION_ATTRIBUTES],
     }, { timeout: 2_000 }).catch(() => undefined);
+    if (observed?.extractionError) throw new Error(observed.extractionError);
     if (!observed) {
       if (responseTurn.page().isClosed()) {
         throw chatGptBrowserTabClosedError();
@@ -5038,6 +5055,7 @@ export class ChatGptBrowserWorker {
     let turnConnection: Browser | undefined;
     let managedPage: Page | undefined;
     let diagnosticPage: Page | undefined;
+    let diagnosticCompleted = false;
     const usageWrites: Promise<void>[] = [];
     const originalAbortSignal = turn.abortSignal;
     const rejectionAbort = new AbortController();
@@ -5876,6 +5894,7 @@ export class ChatGptBrowserWorker {
         atomicWriteFile(this.config.storageStatePath, `${JSON.stringify(state)}\n`);
       }
       await diagnostics.capture(page, "turn-completed");
+      diagnosticCompleted = true;
       console.info(
         `[chatgpt-web] browser turn ${turn.traceId} completed`
         + ` (markdownChars=${finalText.length}, domFullScans=${responseDomCache.fullScans ?? 0}, domCacheHits=${responseDomCache.cacheHits ?? 0})`,
@@ -5895,6 +5914,7 @@ export class ChatGptBrowserWorker {
         if (diagnosticPage && !diagnosticPage.isClosed()) {
           await diagnostics.capture(diagnosticPage, "compaction-handoff-accepted");
         }
+        diagnosticCompleted = true;
         throw turn.abortSignal.reason;
       }
       console.error(
@@ -5906,6 +5926,7 @@ export class ChatGptBrowserWorker {
       }
       throw error;
     } finally {
+      diagnostics.finish(diagnosticCompleted ? "completed" : "failed");
       submissionRejection.dispose();
       await Promise.all(usageWrites);
       prepared.release();

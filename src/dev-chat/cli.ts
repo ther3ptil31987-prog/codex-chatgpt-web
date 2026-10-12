@@ -351,6 +351,9 @@ export async function runDevCommand(args: string[]): Promise<void> {
     if (automaticBrowserInteraction && manualBrowserInteraction) {
       throw new Error("Choose at most one browser interaction mode");
     }
+    const predictions = takeFlag(args, "--composer-predictions");
+    const noPredictions = takeFlag(args, "--no-composer-predictions");
+    if (predictions && noPredictions) throw new Error("Choose --composer-predictions or --no-composer-predictions");
     const skillAttachments = takeFlag(args, "--skill-attachments");
     const inlineSkills = takeFlag(args, "--inline-skills");
     if (skillAttachments && inlineSkills) throw new Error("Choose --skill-attachments or --inline-skills");
@@ -378,6 +381,7 @@ export async function runDevCommand(args: string[]): Promise<void> {
         ? { browserInteractionMode: manualBrowserInteraction ? "manual" : "automatic" }
         : {}),
       ...(biggerContext || standardContext ? { experimentalBiggerContext: biggerContext } : {}),
+      ...(predictions || noPredictions ? { composerPredictionsEnabled: predictions } : {}),
       ...(skillAttachments || inlineSkills ? { experimentalSkillAttachments: skillAttachments } : {}),
       ...(freshConversation || retainedConversation ? { experimentalFreshConversationPerTurn: freshConversation } : {}),
       ...(savedChats || temporaryChats ? { useSavedChats: savedChats } : {}),

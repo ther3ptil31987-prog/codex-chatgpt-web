@@ -10,6 +10,17 @@ const {
   validateSidebarState,
 } = require("../electron/state.cjs");
 
+test("prediction setting starts on and remains off after reopening the state store", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-prediction-state-"));
+  const file = path.join(root, "state.json");
+  try {
+    const store = createStateStore(file);
+    assert.equal(store.read().composerPredictionsEnabled, true);
+    store.update({ composerPredictionsEnabled: false });
+    assert.equal(createStateStore(file).read().composerPredictionsEnabled, false);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
 test("launcher state persists onboarding, language, and autostart atomically", () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-web-gpt-launcher-state-"));
   const file = path.join(root, "state.json");
@@ -27,6 +38,7 @@ test("launcher state persists onboarding, language, and autostart atomically", (
       autoApproveToolCalls: false,
       browserInteractionMode: "automatic",
       experimentalBiggerContext: false,
+      composerPredictionsEnabled: true,
       experimentalSkillAttachments: false,
       experimentalFreshConversationPerTurn: false,
       useSavedChats: false,
@@ -57,6 +69,7 @@ test("launcher state persists onboarding, language, and autostart atomically", (
       autoApproveToolCalls: false,
       browserInteractionMode: "automatic",
       experimentalBiggerContext: false,
+      composerPredictionsEnabled: true,
       experimentalSkillAttachments: false,
       experimentalFreshConversationPerTurn: false,
       useSavedChats: false,
@@ -138,6 +151,7 @@ test("persisted sidebar corruption is repaired without changing the rest of laun
       autoApproveToolCalls: false,
       browserInteractionMode: "automatic",
       experimentalBiggerContext: false,
+      composerPredictionsEnabled: true,
       experimentalSkillAttachments: false,
       experimentalFreshConversationPerTurn: false,
       useSavedChats: false,

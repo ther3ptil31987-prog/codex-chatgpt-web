@@ -1839,6 +1839,7 @@ for (const captureScreenshots of [false, true]) test(`connector failure persists
     const [traceDirectory] = readdirSync(diagnosticsRoot);
     expect(traceDirectory).toStartWith("verify_contract_trace-");
     const files = readdirSync(join(diagnosticsRoot, traceDirectory!));
+    expect(JSON.parse(readFileSync(join(diagnosticsRoot, traceDirectory!, ".trace-state"), "utf8")).status).toBe("failed");
     expect(screenshots).toBe(captureScreenshots ? 4 : 0);
     expect(files.filter(name => name.endsWith(".png"))).toHaveLength(screenshots);
     const checkpoints = files
@@ -1896,6 +1897,7 @@ test("successful connector verification clears the proven selection before relea
     expect(result).toBe("Codex Native2 DEV");
     expect(calls).toEqual(["prepare", "select", "clear"]);
     const [traceDirectory] = readdirSync(diagnosticsRoot);
+    expect(JSON.parse(readFileSync(join(diagnosticsRoot, traceDirectory!, ".trace-state"), "utf8")).status).toBe("completed");
     const checkpoints = readdirSync(join(diagnosticsRoot, traceDirectory!))
       .filter(name => name.endsWith(".json"))
       .sort()
@@ -2544,8 +2546,9 @@ test("Luna-only browser turns verify selector absence instead of opening an effo
     isVisible: async () => false,
   };
   const visibleControls = { count: async () => 0 };
+  const thinkControls = { or() { return this; }, filter: () => visibleControls };
   const composerForm = {
-    locator: () => ({ filter: () => visibleControls }),
+    locator: () => thinkControls,
     getByRole: () => ({ filter: () => ({ count: async () => 0 }) }),
   };
   const composer = { locator: () => composerForm };
@@ -2573,41 +2576,36 @@ test("Luna-only browser turns verify selector absence instead of opening an effo
   expect(checkpoints).toEqual(["luna-default-confirmed"]);
 });
 
-function thinkSlashFixture() {
-  const state = { pressed: false, controlPresent: true, highlighted: true, popupCount: 1, optionCount: 1,
-    draft: "", connectors: [] as string[], loseConnector: false, commands: [] as string[], enters: 0 };
-  const control = { getAttribute: async () => state.pressed ? "true" : "false",
-    click: async () => { state.pressed = !state.pressed; } };
-  const controls = { count: async () => state.controlPresent ? 1 : 0, first: () => control };
-  const row = { getAttribute: async () => state.highlighted ? "" : null,
-    waitFor: async () => { if (!state.optionCount) throw new Error("Think command is unavailable"); } };
-  const rows = { filter: () => rows, first: () => row, count: async () => state.optionCount };
-  const popup = { filter: () => popup, locator: () => rows, count: async () => state.popupCount };
-  const page = { locator: (selector: string) => selector === '[role="dialog"]' ? dialogPage("").page.locator(selector) : popup };
+function thinkButtonFixture() {
+  const state = { pressed: false, controlCount: 1, draft: "", connectors: [] as string[],
+    commands: [] as string[], keys: [] as string[], clicks: 0 };
+  const control = { getAttribute: async (): Promise<string | null> => state.pressed ? "true" : "false",
+    click: async () => { state.clicks += 1; state.pressed = !state.pressed; },
+    waitFor: async () => { if (!state.controlCount) throw new Error("Think button is unavailable"); } };
+  const controls = { count: async () => state.controlCount, first: () => control,
+    or() { return this; }, filter() { return this; } };
+  const page = { locator: (selector: string) => {
+    if (selector === '[role="dialog"]') return dialogPage("").page.locator(selector);
+    throw new Error(`Unexpected page locator: ${selector}`);
+  } };
   const composer = {
     filter: () => composer, first: () => composer, locator: () => composerForm,
     evaluate: async () => ({ text: state.draft.trim(), connectors: [...state.connectors] }),
     focus: async () => {},
     fill: async (text: string) => { state.draft = text; state.connectors = []; },
     pressSequentially: async (text: string) => { state.commands.push(text); state.draft += text; },
-    press: async (key: string) => {
-      if (key === "ArrowDown") state.highlighted = true;
-      if (key === "Enter") {
-        if (state.draft !== "/think" || !state.highlighted) throw new Error("Unexpected composer submission");
-        state.enters += 1; state.pressed = !state.pressed; state.controlPresent = true; state.draft = "";
-        if (state.loseConnector) state.connectors = [];
-      }
-    },
+    press: async (key: string) => { state.keys.push(key); },
   };
   const composerForm = {
-    locator: (selector: string) => selector === CHATGPT_THINK_BUTTON_SELECTOR ? { filter: () => controls } : composer,
+    locator: (selector: string) => selector === CHATGPT_THINK_BUTTON_SELECTOR ? controls : composer,
+    getByRole: () => controls,
     page: () => page,
   };
   return { state, composer, composerForm, page, control };
 }
 
 test("Think toggle preserves connectors and normal Luna clears it", async () => {
-  const { state, composer } = thinkSlashFixture();
+  const { state, composer } = thinkButtonFixture();
   state.connectors = ["Codex Native2"];
   const checkpoints: string[] = [];
 
@@ -2621,28 +2619,41 @@ test("Think toggle preserves connectors and normal Luna clears it", async () => 
   expect(state.pressed).toBeFalse();
   expect(state.commands).toEqual([]);
   expect(state.draft).toBe("");
-  expect(checkpoints.filter(checkpoint => !checkpoint.startsWith("think-slash-"))).toEqual(["think-enabled", "think-disabled"]);
+  expect(checkpoints).toEqual(["think-enabled", "think-disabled"]);
+  expect(state.clicks).toBe(2);
+  expect(state.keys).toEqual([]);
 });
 
-test("Think slash requires one command and verifies a newly exposed control", async () => {
-  const ui = thinkSlashFixture();
-  ui.state.controlPresent = false;
+test("missing, ambiguous or unverified Think buttons never type or submit a command", async () => {
+  for (const scenario of ["missing", "ambiguous", "invalid-state", "draft"] as const) {
+    const ui = thinkButtonFixture();
+    ui.state.connectors = ["Codex Native2"];
+    if (scenario === "missing") ui.state.controlCount = 0;
+    if (scenario === "ambiguous") ui.state.controlCount = 2;
+    if (scenario === "invalid-state") ui.control.getAttribute = async () => null;
+    if (scenario === "draft") ui.state.draft = "Keep this draft";
+    const before = { ...ui.state };
+    await expect(setChatGptThinkMode(ui.composer as never, true)).rejects.toThrow({
+      missing: "Think button is unavailable", ambiguous: "2 visible Think controls",
+      "invalid-state": "no semantic pressed state", draft: "requires an empty prompt draft",
+    }[scenario]);
+    expect(ui.state).toEqual(before);
+  }
+});
+
+test("Think waits for its button to mount without typing a command", async () => {
+  const ui = thinkButtonFixture();
+  ui.state.controlCount = 0;
+  ui.control.waitFor = async () => { ui.state.controlCount = 1; };
   await setChatGptThinkMode(ui.composer as never, true);
   expect(ui.state.pressed).toBeTrue();
-  const ambiguous = thinkSlashFixture();
-  ambiguous.state.controlPresent = false;
-  ambiguous.state.optionCount = 2;
-  await expect(setChatGptThinkMode(ambiguous.composer as never, true)).rejects.toThrow("exactly one command option");
-  expect(ambiguous.state.enters).toBe(0);
-  const unavailable = thinkSlashFixture();
-  unavailable.state.controlPresent = false;
-  unavailable.state.optionCount = 0;
-  await expect(setChatGptThinkMode(unavailable.composer as never, true)).rejects.toThrow("Think command is unavailable");
-  expect(unavailable.state.enters).toBe(0);
+  expect(ui.state.clicks).toBe(1);
+  expect(ui.state.commands).toEqual([]);
+  expect(ui.state.keys).toEqual([]);
 });
 
 test("a failed Think toggle does not attempt a second action or alter the draft", async () => {
-  const ui = thinkSlashFixture();
+  const ui = thinkButtonFixture();
   ui.state.connectors = ["Codex Native2"];
   ui.control.click = async () => { throw new Error("Toggle failed"); };
   await expect(setChatGptThinkMode(ui.composer as never, true)).rejects.toThrow("Toggle failed");
@@ -2654,7 +2665,7 @@ test("a failed Think toggle does not attempt a second action or alter the draft"
 test("Think attachment preserves the plugin on first and follow-up messages and supports Browser-only turns", async () => {
   const attach = (ChatGptBrowserWorker.prototype as unknown as { attachPrompt: (...args: unknown[]) => Promise<void> }).attachPrompt;
   for (const localTools of [true, false]) {
-    const ui = thinkSlashFixture();
+    const ui = thinkButtonFixture();
     let connectorSelections = 0;
     const submitted: boolean[] = [];
     const worker = {
@@ -2676,28 +2687,30 @@ test("Think attachment preserves the plugin on first and follow-up messages and 
   }
 });
 
-test("Think attachment works when the slash command removes plugin mentions", async () => {
-  const ui = thinkSlashFixture();
-  ui.state.controlPresent = false;
-  ui.state.loseConnector = true;
+test("Think attachment does not select a plugin or insert a prompt when its button is unavailable", async () => {
+  const ui = thinkButtonFixture();
+  ui.state.controlCount = 0;
   let insertions = 0;
+  let selections = 0;
   const worker = {
     activeComposer: async () => ui.composer,
-    selectConnector: async () => { ui.state.connectors = ["Codex Native2"]; return ui.composer; },
+    selectConnector: async () => { selections += 1; return ui.composer; },
     insertPromptText: async () => { insertions += 1; },
     assertPromptAttached: async () => {},
     clearChatGptComposerState: async () => { ui.state.draft = ""; ui.state.connectors = []; },
   };
   const attach = (ChatGptBrowserWorker.prototype as unknown as { attachPrompt: (...args: unknown[]) => Promise<void> }).attachPrompt;
-  await attach.call(worker, ui.page, "task", true, undefined, undefined, false, undefined, true);
-  expect(ui.state.pressed).toBeTrue();
-  expect(ui.state.connectors).toEqual(["Codex Native2"]);
-  expect(insertions).toBe(1);
+  await expect(attach.call(worker, ui.page, "task", true, undefined, undefined, false, undefined, true))
+    .rejects.toThrow("Think button is unavailable");
+  expect(ui.state.pressed).toBeFalse();
+  expect(ui.state.commands).toEqual([]);
+  expect(ui.state.keys).toEqual([]);
+  expect(selections).toBe(0);
+  expect(insertions).toBe(0);
 });
 
 test("Think attachment rolls back when connector selection disables Think", async () => {
-  const ui = thinkSlashFixture();
-  ui.state.loseConnector = true;
+  const ui = thinkButtonFixture();
   let insertions = 0;
   let cleanup = 0;
   const worker = {

@@ -54,6 +54,7 @@ export interface SetupOptions {
   forceLogin?: boolean;
   autoApproveToolCalls?: boolean;
   experimentalBiggerContext?: boolean;
+  composerPredictionsEnabled?: boolean;
   experimentalSkillAttachments?: boolean;
   experimentalFreshConversationPerTurn?: boolean;
   useSavedChats?: boolean;
@@ -149,6 +150,7 @@ function meaningfulRuntimeChange(before: AppConfig, after: AppConfig): boolean {
     extraHighAvailable: before.extraHighAvailable,
     proAvailable: before.proAvailable,
     experimentalBiggerContext: before.experimentalBiggerContext,
+    composerPredictionsEnabled: before.composerPredictionsEnabled,
     experimentalSkillAttachments: before.experimentalSkillAttachments,
     experimentalFreshConversationPerTurn: before.experimentalFreshConversationPerTurn,
     useSavedChats: before.useSavedChats,
@@ -180,6 +182,7 @@ function meaningfulRuntimeChange(before: AppConfig, after: AppConfig): boolean {
     extraHighAvailable: after.extraHighAvailable,
     proAvailable: after.proAvailable,
     experimentalBiggerContext: after.experimentalBiggerContext,
+    composerPredictionsEnabled: after.composerPredictionsEnabled,
     experimentalSkillAttachments: after.experimentalSkillAttachments,
     experimentalFreshConversationPerTurn: after.experimentalFreshConversationPerTurn,
     useSavedChats: after.useSavedChats,
@@ -296,6 +299,9 @@ function baseConfig(
     delete config.browserHostDescriptorPath;
   }
   if (options.autoApproveToolCalls !== undefined) config.autoApproveToolCalls = options.autoApproveToolCalls;
+  if (options.composerPredictionsEnabled !== undefined) {
+    config.composerPredictionsEnabled = options.composerPredictionsEnabled;
+  }
   if (options.experimentalSkillAttachments !== undefined) {
     config.experimentalSkillAttachments = options.experimentalSkillAttachments;
   }

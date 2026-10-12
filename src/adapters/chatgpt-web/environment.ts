@@ -87,6 +87,12 @@ function clientTurnMetadata(parsed: CodexParsedRequest): Record<string, unknown>
   return clientTurnMetadataFromBody(parsed._rawBody);
 }
 
+/** Codex supplies this lifecycle marker on its ephemeral composer-prediction turn. */
+export function isCodexComposerPrediction(value: unknown): boolean {
+  const metadata = clientTurnMetadataFromBody(value);
+  return metadata?.request_kind === "turn" && metadata.turn_trigger === "composer_predictions";
+}
+
 function itemTurnId(value: unknown): string | undefined {
   const turnId = record(record(value)?.internal_chat_message_metadata_passthrough)?.turn_id;
   return typeof turnId === "string" ? turnId : undefined;
