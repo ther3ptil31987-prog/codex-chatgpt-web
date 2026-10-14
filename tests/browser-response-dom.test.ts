@@ -81,6 +81,50 @@ async function snapshots(html: string, changes: Array<(document: Document) => vo
   }
 }
 
+const followupFixture = (root = 'data-markdown-text-style="assistant-message"') => `<section id="turn"><div data-content-search-unit-key="answer"><h4 data-conversation-role="assistant"></h4><div ${root}>
+<p>The report is complete.</p>
+<div class="relative min-w-0 px-3"><div class="flex min-w-0 flex-col items-start">
+<button class="group/suggested-followup"><span>Clarify the result</span></button>
+<button class="group/suggested-followup"><span>Shorten the report</span></button>
+</div><div aria-hidden="true" class="pointer-events-none start-0 top-0 w-max">
+<div><span>Clarify the result</span><span>Shorten the report</span></div>
+</div></div></div></div><button data-testid="copy-turn-action-button" aria-label="Copy"></button></section>`;
+
+test("suggested follow-up sizing copies stay out of the answer", async () => {
+  for (const root of ['class="markdown"', 'data-markdown-text-style="assistant-message"']) {
+    const result = await snapshot(followupFixture(root));
+    expect(result.visibleText).toBe("The report is complete.");
+    expect(chatGptHtmlToMarkdown(result.fullHtml)).toBe("The report is complete.");
+    expect(result.markdownSegments.map(segment => segment.text).join("\n")).not.toContain("Clarify the result");
+    expect(result.fullHtml).not.toContain("Shorten the report");
+    expect(result.completionActionVisible).toBeTrue();
+  }
+});
+
+test("changing follow-up sizing labels cannot rewrite delivered answer text", async () => {
+  const [before, after] = await snapshots(followupFixture(), [document => {
+    document.querySelector('[aria-hidden="true"] span')!.textContent = "A hydrated suggestion";
+  }]);
+  expect(before!.visibleText).toBe("The report is complete.");
+  expect(after!.visibleText).toBe(before!.visibleText);
+  expect(after!.fullHtml).toBe(before!.fullHtml);
+  const buffer = new ChatGptMarkdownBuffer(undefined, 0);
+  buffer.observe(before!.markdownSegments, 0);
+  buffer.observe(after!.markdownSegments, 1);
+  expect(buffer.finish().markdown).toBe("The report is complete.");
+});
+
+test("follow-up filtering preserves unrelated content and file-reference labels", async () => {
+  const html = followupFixture().replace('<p>The report is complete.</p>', `<p>The report is complete.</p>
+<p><span aria-hidden="true">Unrelated answer content.</span><button class="behavior-btn entity-underline">report.pdf</button></p>
+<pre><code>&lt;button class="group/suggested-followup"&gt;example&lt;/button&gt;</code></pre>`);
+  const result = await snapshot(html);
+  expect(result.visibleText).toContain("Unrelated answer content.");
+  expect(result.visibleText).toContain("report.pdf");
+  expect(chatGptHtmlToMarkdown(result.fullHtml)).toContain('class="group/suggested-followup"');
+  expect(result.visibleText).not.toContain("Clarify the result");
+});
+
 test("captured Activity progress is commentary before any assistant answer exists", async () => {
   const progress = await snapshot(powerActivityHtml);
   expect(progress.responsePresent).toBeTrue();

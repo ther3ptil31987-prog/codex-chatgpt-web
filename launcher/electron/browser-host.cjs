@@ -12,6 +12,7 @@ const { processRunning } = require("./process-tree.cjs");
 const { validatePasskeyLoginState } = require("./passkey-login-state.cjs");
 const { configureChatGptAnnouncementDismissal } = require("./browser-announcements.cjs");
 const { readChatGptAuthSession } = require("./chatgpt-auth-session.cjs");
+const { runBrowserPageScript } = require("./browser-page-script.cjs");
 const {
   refreshTurnLeasesAfterSuspension,
   shouldBlockSleepForTurns,
@@ -385,6 +386,8 @@ class BrowserHost {
     this.cloudflareChallengeRecoverySettleMs = CLOUDFLARE_CHALLENGE_RECOVERY_SETTLE_MS;
     this.viewportCssKey = null;
     this.primaryRendererReady = false;
+    this.primaryRendererRecovery = null;
+    this.primaryRendererRecoveryNeeded = false;
     this.primaryDeviceEmulationViewport = null;
     this.primaryDeviceEmulationDirty = true;
     this.shellZoomShortcutBindings = new Map();
@@ -449,6 +452,7 @@ class BrowserHost {
 
   async ready() {
     await this.initializationReady;
+    if (this.primaryRendererRecovery) await this.primaryRendererRecovery;
   }
 
   async initializePrimaryView() {
@@ -1108,6 +1112,7 @@ class BrowserHost {
         return;
       }
       this.setState({ url, loading: false });
+      if (this.primaryRendererRecovery) return; // Recovery establishes ownership once below.
       void this.applyViewportCss();
       void this.markOwnedSurface()
         .then(() => this.probeAuthentication())
@@ -1167,9 +1172,51 @@ class BrowserHost {
       this.clearHomeNavigationTimeout();
       this.primaryNavigationError = new Error(`ChatGPT renderer stopped: ${details.reason}`);
       this.primaryRendererReady = false;
+      this.authenticationRevision = (this.authenticationRevision ?? 0) + 1;
+      this.authenticationProbe = null;
       this.logger.error("browser.renderer_gone", { reason: details.reason, exitCode: details.exitCode });
       this.setState({ status: "error", message: `Browser renderer stopped: ${details.reason}`, loading: false });
+      if (!this.destroyed && details.reason !== "clean-exit" && !this.primaryRendererRecovery) {
+        this.primaryRendererRecoveryNeeded = true;
+        // Let all listeners reject work owned by the dead document before reloading it.
+        queueMicrotask(() => { void this.recoverPrimaryRenderer(); });
+      }
     });
+  }
+
+  recoverPrimaryRenderer() {
+    if (this.destroyed || this.manualOperation || !this.primaryRendererRecoveryNeeded
+      || this.primaryRendererRecovery) return this.primaryRendererRecovery;
+    this.primaryRendererRecoveryNeeded = false;
+    const contents = this.view.webContents;
+    const operation = Promise.resolve().then(async () => {
+      // The primary view owns sign-in, not a running model turn. Recreate its local idle
+      // document in the same session; never resend a task or clear authentication here.
+      await loadCommittedBrowserSurface(contents, IDLE_BROWSER_URL);
+      if (this.destroyed) return;
+      this.primaryNavigationError = null;
+      this.primaryRendererReady = true;
+      if (browserInteractionModeFor(this) === "automatic") await this.markOwnedSurface();
+      if (this.destroyed) return;
+      this.writeDescriptor();
+      this.setState({
+        status: this.state.authenticated ? "ready" : "signed-out",
+        message: this.state.authenticated ? "Browser recovered. Open ChatGPT to continue." : "Sign in to ChatGPT",
+        url: IDLE_BROWSER_URL, loading: false,
+      });
+      this.logger.info("browser.renderer_recovered");
+    });
+    const tracked = operation.catch(error => {
+      if (this.destroyed) return;
+      this.primaryNavigationError = error;
+      this.primaryRendererReady = false;
+      this.setState({ status: "error", message: "Could not restart the ChatGPT browser. Open sign in to retry.", loading: false });
+      this.logger.error("browser.renderer_recovery_failed", navigationErrorForLog(error));
+    }).finally(() => {
+      if (this.primaryRendererRecovery === tracked) this.primaryRendererRecovery = null;
+    });
+    this.primaryRendererRecovery = tracked;
+    return tracked;
   }
 
   armHomeNavigationTimeout(contents, url) {
@@ -1281,7 +1328,8 @@ class BrowserHost {
   }
 
   refreshAuthenticationFromSession() {
-    if (this.destroyed || this.reauthenticationRequired || browserInteractionModeFor(this) !== "automatic") return Promise.resolve();
+    if (this.destroyed || this.primaryRendererRecoveryNeeded || this.primaryRendererRecovery
+      || this.reauthenticationRequired || browserInteractionModeFor(this) !== "automatic") return Promise.resolve();
     this.authenticationRevision = (this.authenticationRevision ?? 0) + 1;
     if (this.authenticationRefresh) return this.authenticationRefresh;
     const operation = (async () => {
@@ -1997,7 +2045,7 @@ class BrowserHost {
   async markOwnedSurface() {
     requireAutomaticBrowserInspection(this, "ChatGPT DOM surface ownership marking");
     const surfaceId = JSON.stringify(this.surfaceId);
-    await this.view.webContents.executeJavaScript(`(() => {
+    await runBrowserPageScript(this.view.webContents, `(() => {
       Object.defineProperty(globalThis, "__CODEX_WEB_GPT_SURFACE_ID__", {
         value: ${surfaceId},
         configurable: true,
@@ -2006,7 +2054,7 @@ class BrowserHost {
       });
       document.documentElement.dataset.codexWebGptSurface = ${surfaceId};
       (${configureChatGptAnnouncementDismissal.toString()})(true);
-    })()`, true);
+    })()`);
   }
 
   show() {
@@ -2901,6 +2949,9 @@ class BrowserHost {
 
   async probeAuthentication() {
     requireAutomaticBrowserInspection(this, "ChatGPT authentication probe");
+    if (this.destroyed || this.primaryRendererRecoveryNeeded || this.primaryRendererRecovery) {
+      throw new Error("ChatGPT browser is unavailable while its renderer restarts. Retry when it is ready.");
+    }
     if (this.reauthenticationRequired
       && !["ChatGPT login", "ChatGPT passkey login", "ChatGPT logout"].includes(this.manualOperation)) return this.snapshot();
     if (this.authenticationProbe) return this.authenticationProbe;
@@ -2923,7 +2974,7 @@ class BrowserHost {
         this.setState({ status: "signed-out", message: "Sign in to ChatGPT", authenticated: false, url });
         return this.snapshot();
       }
-      const probe = (contents) => contents.executeJavaScript(`(async () => {
+      const probe = (contents) => runBrowserPageScript(contents, `(async () => {
         const expectedUrl = new URL(${JSON.stringify(TEMPORARY_CHAT_URL)});
         const readSurface = () => {
           const composer = ${visibleElementScript(COMPOSER_SELECTOR)};
@@ -2942,7 +2993,7 @@ class BrowserHost {
           ? await (${readChatGptAuthSession.toString()})(fetch.bind(globalThis), expectedUrl.origin, ${CHATGPT_AUTH_SESSION_TIMEOUT_MS})
           : { sessionAuthenticated: false, sessionCheckError: null };
         return { ...readSurface(), ...session };
-      })()`, true).catch(() => ({
+      })()`).catch(() => ({
         url: "",
         composer: false,
         temporary: false,
@@ -2951,6 +3002,7 @@ class BrowserHost {
         readyState: "unknown",
       }));
       let result = await probe(this.view.webContents);
+      if (this.destroyed || revision !== this.authenticationRevision) return this.snapshot();
       if (!(result.composer && result.temporary && result.sessionAuthenticated)
         && this.authView
         && !this.authView.webContents.isDestroyed()) {
@@ -3170,6 +3222,7 @@ class BrowserHost {
     } finally {
       if (contents && !contents.isDestroyed()) contents.setBackgroundThrottling(true);
       this.manualOperation = null;
+      if (this.primaryRendererRecoveryNeeded) void this.recoverPrimaryRenderer();
     }
   }
 

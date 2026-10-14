@@ -336,6 +336,7 @@ test("launcher repairs its runtime before building the tunnel MCP command", asyn
       runtimeRepairs += 1;
       return repairedRuntime;
     },
+    resolveProxy: async () => "DIRECT",
     coreHome: root,
     browserDescriptorPath: config.browserHostDescriptorPath,
     runtimeInvocationFactory: ({ installedRuntimeRoot, args }) => ({
@@ -859,6 +860,7 @@ if (args[1] === "connect") {
     app: { getVersion: () => "0.2.0", isPackaged: false },
     logger: { info() {}, warn() {}, error() {} },
     sourceRoot: root, coreHome: root, browserDescriptorPath: path.join(root, "launcher.json"),
+    resolveProxy: async () => "DIRECT",
   });
   let monitored = false;
   const config = { mode: "full", brokerSocketPath: path.join(root, "broker.sock"), tunnel: {

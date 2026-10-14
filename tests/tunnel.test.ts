@@ -145,12 +145,43 @@ test("tunnel verification and install errors survive failed cleanup and rollback
   });
 });
 
-test("pins the fixed tunnel-client and migrates only the previously shipped version", () => {
-  expect(TUNNEL_VERSION).toBe("0.0.12");
-  expect(tunnelClientInstallAction("0.0.12")).toBe("reuse");
+test("pins the fixed tunnel-client and migrates only previously shipped versions", () => {
+  expect(TUNNEL_VERSION).toBe("0.0.16");
+  expect(tunnelClientInstallAction("0.0.16")).toBe("reuse");
+  expect(tunnelClientInstallAction("0.0.12")).toBe("upgrade");
   expect(tunnelClientInstallAction("0.0.10")).toBe("upgrade");
   expect(() => tunnelClientInstallAction("0.0.11")).toThrow("not a trusted upgrade source");
   expect(() => tunnelClientInstallAction("9.9.9")).toThrow("not a trusted upgrade source");
+});
+
+test("upgrades 0.0.12 with verified assets and restores it if manifest installation fails", async () => {
+  // Windows files do not expose Unix execute bits, so keep the filesystem checks native.
+  const platform = process.platform === "win32" ? "win32" : "darwin";
+  for (const failManifest of [false, true]) await withTunnelInstall(platform, async fixture => {
+    const manifest = join(fixture.root, "bin", "tunnel-client-manifest.json");
+    const oldBinary = "trusted 0.0.12 binary";
+    const oldManifest = JSON.stringify({ version: 1, tunnelClientVersion: "0.0.12",
+      binarySha256: createHash("sha256").update(oldBinary).digest("hex") });
+    fs.writeFileSync(fixture.executable, oldBinary, { mode: 0o700 });
+    fs.writeFileSync(manifest, oldManifest);
+    fixture.verify.mockImplementation(path => ({ status: 0,
+      stdout: path === fixture.executable ? "0.0.12" : TUNNEL_VERSION, stderr: "" }));
+    let manifestWrites = 0;
+    fixture.write.mockImplementation((path, data, options) => {
+      if (path === manifest && ++manifestWrites === 1 && failManifest) throw new Error("manifest write failed");
+      fixture.originalWrite(path, data, options);
+    });
+    if (failManifest) {
+      await expect(installTunnelClient()).rejects.toThrow("manifest write failed");
+      expect(fs.readFileSync(fixture.executable, "utf8")).toBe(oldBinary);
+      expect(fs.readFileSync(manifest, "utf8")).toBe(oldManifest);
+    } else {
+      expect(await installTunnelClient()).toBe(fixture.executable);
+      expect(fs.readFileSync(fixture.executable)).toEqual(Buffer.from(fixture.binary));
+      expect(JSON.parse(fs.readFileSync(manifest, "utf8")).tunnelClientVersion).toBe("0.0.16");
+    }
+    expect(fixture.download.mock.calls.every(call => String(call[0]).includes("/v0.0.16/"))).toBe(true);
+  });
 });
 
 describe("tunnel status boundary", () => {

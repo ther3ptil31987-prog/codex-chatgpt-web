@@ -179,9 +179,18 @@ export function unattributedChatGptEnvironmentMessages(
 function contextualUserMessage(value: Record<string, unknown>): boolean {
   const text = rawMessageText(value).trim();
   return hasEnvironmentContextFragment(value)
+    || isNativeOpenPageContext(value)
     || /^<subagent_notification>[\s\S]*<\/subagent_notification>$/.test(text)
     || isReadableCompactionSummaryText(text)
     || text === OPAQUE_COMPACTION_NOTE;
+}
+
+/** Page context is not an instruction; literal wrappers in ordinary user text still are. */
+function isNativeOpenPageContext(item: Record<string, unknown> | undefined): boolean {
+  if (item?.type !== "message" || item.role !== "user"
+    || typeof item.id !== "string" || !item.id || !itemTurnId(item)?.trim()) return false;
+  const kinds = record(item.internal_chat_message_metadata_passthrough)?.content_item_kinds;
+  return Array.isArray(kinds) && kinds.length === 1 && kinds[0] === "additional_content.codex_apps_open_page";
 }
 
 function compactionSummaryMessage(value: Record<string, unknown>): boolean {
@@ -316,14 +325,18 @@ export function extractChatGptCompactionSourceRevision(parsed: CodexParsedReques
   return revision;
 }
 
-/** A completed checkpoint binds an older instruction to this exact continuing native turn. */
+/** A completed checkpoint identifies the current turn's rebuilt environment preamble. */
 export function isChatGptCompactionContinuation(parsed: CodexParsedRequest): boolean {
   const identity = extractChatGptTurnIdentity(parsed);
   const revision = latestChatGptTurnUserRevision(parsed, identity.turnId);
   return revision?.turnId !== undefined && identity.turnId !== undefined
-    && revision.turnId !== identity.turnId
     && !priorChatGptAbortedTurnIds(parsed).includes(revision.turnId)
-    && isAcceptedCompactionContinuation(parsed, identity, revision);
+    // Pre-turn compaction can append the new instruction after the checkpoint. It still
+    // rebuilds the preamble before the retained older instruction; the store must validate
+    // that claim against the current native rollout just as for an older-source continuation.
+    && (revision.turnId === identity.turnId
+      ? recoverCompactionInstruction(parsed, identity) !== undefined
+      : isAcceptedCompactionContinuation(parsed, identity, revision));
 }
 
 export interface ChatGptEnvironmentClaim {
@@ -461,7 +474,7 @@ function environmentBeforeUser(input: unknown[], userIndex: number, expectedTurn
 
   let candidateIndex = userIndex - 1;
   let candidate = record(input[candidateIndex]);
-  while (candidate?.type === "message" && candidate.role === "developer") {
+  while (candidate?.type === "message" && (candidate.role === "developer" || isNativeOpenPageContext(candidate))) {
     const developerTurnId = itemTurnId(candidate);
     if (developerTurnId !== userTurnId) return undefined;
     candidateIndex -= 1;
@@ -634,7 +647,8 @@ function canonicalMetadataEnvironmentBefore(
 
   let candidateIndex = anchorIndex - 1;
   let candidate = record(input[candidateIndex]);
-  while (candidate?.type === "message" && (candidate.role === "developer" || compactionSummaryMessage(candidate))) {
+  while (candidate?.type === "message" && (candidate.role === "developer"
+    || compactionSummaryMessage(candidate) || isNativeOpenPageContext(candidate))) {
     const developerTurnId = itemTurnId(candidate);
     const serverOwnedId = typeof candidate.id === "string" && candidate.id.length > 0;
     if (developerTurnId === undefined ? !serverOwnedId : developerTurnId !== metadataTurnId) return undefined;
@@ -653,7 +667,7 @@ function canonicalMetadataEnvironmentBefore(
     if (!/^<environment_context>[\s\S]*<\/environment_context>$/.test(trimmed)) continue;
     // Current Codex stamps server-owned item IDs but not per-item turn IDs on the initial request,
     // and canonical workspaces contains Git enrichment rather than filesystem authority. Bind the
-    // structurally adjacent context (allowing only provenance-checked developer messages) to
+    // structurally adjacent context (allowing provenance-checked developer and native page items) to
     // canonical turn/sandbox metadata; when Git roots are present, require the primary cwd to agree
     // with them as an additional check.
     if (!environmentMatchesCanonicalMetadata(trimmed, metadata, requireMetadataBoundRoots)) continue;
