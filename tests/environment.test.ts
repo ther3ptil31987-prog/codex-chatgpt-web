@@ -1569,6 +1569,55 @@ describe("trusted Codex task environment continuity", () => {
     expect(() => store.resolve(request)).toThrow("current turn");
   });
 
+  test("compaction keeps current native output-directory grants omitted from workspace roots", () => {
+    const { codexHome, request, rolloutPath } = resumedRootFixture();
+    const body = request._rawBody as { input: Array<Record<string, unknown>>; client_metadata: Record<string, string> };
+    const oldTurnId = "01a06c66-0000-75c6-a0df-318f890ef6de";
+    body.input[0]!.internal_chat_message_metadata_passthrough = { turn_id: oldTurnId };
+    const summary = "Confirmed output-directory checkpoint";
+    rememberCompactionContinuation({ ...request, _compactionRequest: true }, extractChatGptTurnIdentity(request), [
+      { turnId: oldTurnId, content: body.input[0]!.content },
+    ], summary);
+    const environmentPart = { type: "input_text", text: filesystemEnvironmentXml(workspaceWriteProfileXml) };
+    body.input.unshift({
+      type: "message", role: "user", id: "msg_current_environment", content: [environmentPart],
+      internal_chat_message_metadata_passthrough: { turn_id: rolloutTurnId },
+    });
+    body.input.push({ type: "compaction", encrypted_content: encodeCompactionSummary(summary) });
+    const metadata = JSON.parse(body.client_metadata["x-codex-turn-metadata"]!);
+    metadata.sandbox_mode = "workspace-write";
+    body.client_metadata["x-codex-turn-metadata"] = JSON.stringify(metadata);
+    const output = join(codexHome, "native-output");
+    const entries = [
+      { path: { type: "special", value: { kind: "root" } }, access: "read" },
+      ...[root, output].map(path => ({ path: { type: "path", path }, access: "write" })),
+      { path: { type: "special", value: { kind: "slash_tmp" } }, access: "write" },
+      { path: { type: "special", value: { kind: "tmpdir" } }, access: "write" },
+    ];
+    writeFileSync(rolloutPath, [
+      { type: "session_meta", payload: { id: rolloutThreadId, source: "vscode" } },
+      childTurnContext(rolloutTurnId, {
+        sandbox_policy: { type: "workspace-write", writable_roots: [output], network_access: true },
+        permission_profile: { type: "managed", file_system: { type: "restricted", entries }, network: "enabled" },
+        file_system_sandbox_policy: { kind: "restricted", entries },
+      }),
+    ].map(value => JSON.stringify(value)).join("\n") + "\n");
+    const store = new ChatGptThreadEnvironmentStore(undefined, Date.now, codexHome);
+    expect(store.resolve(request)).toMatchObject({
+      cwd: root, roots: [root], writableRoots: [root, output],
+      sandboxPolicy: { type: "workspaceWrite", writableRoots: [root, output], networkAccess: true },
+    });
+    const original = environmentPart.text;
+    for (const conflicting of [
+      original.replaceAll(root, join(codexHome, "unproven-project")),
+      original.replace("<filesystem>", "<network_access>restricted</network_access><filesystem>"),
+      filesystemEnvironmentXml(readOnlyProfileXml),
+    ]) {
+      environmentPart.text = conflicting;
+      expect(() => store.resolve(request)).toThrow("environment conflicts");
+    }
+  });
+
   test("old untagged transcript context cannot block or replace current rollout authority after restart", () => {
     const { codexHome, request } = resumedRootFixture();
     const oldRoot = resolve(root, "previous-workspace");

@@ -1622,6 +1622,7 @@ describe("ChatGPT outer-native harness v4", () => {
     expect(compiled.text).toContain("Use actual Codex Native results as evidence");
     expect(compiled.text).toContain("Write the user-facing final answer only after the last required tool result has settled");
     expect(compiled.text.match(/turn_123456789012345678901234/g)).toHaveLength(1);
+    expect(compiled.turnToken).toBe("turn_123456789012345678901234");
     expect(compiled.text).not.toContain("codex_bind_turn");
     expect(compiled.text).not.toContain("binding_id");
     const files = chatGptImageFilePayloads(compiled.images);
@@ -1715,6 +1716,7 @@ describe("ChatGPT outer-native harness v4", () => {
     ];
 
     const compiled = compileChatGptWebPrompt(request, browserOnlyCapabilities);
+    expect(compiled.turnToken).toBeUndefined();
     expect(compiled.text).toContain("ChatGPT Web Pro with no Codex Native bridge to the user's local computer");
     expect(compiled.text).toContain("web search, browsing, research");
     expect(compiled.text).toContain("prepared workspace evidence");

@@ -63,6 +63,42 @@ test.skipIf(!process.env.CHATGPT_DOM_TEST_BROWSER)("Think buttons do not require
   } finally { await browser.close(); }
 }, 15_000);
 
+test.skipIf(!process.env.CHATGPT_DOM_TEST_BROWSER)("Think preserves both plugin pill formats and rejects plugin replacement", async () => {
+  const browser = await chromium.launch({ executablePath: process.env.CHATGPT_DOM_TEST_BROWSER, headless: true });
+  try {
+    const page = await browser.newPage();
+    for (const { markup, identity, replacement } of [
+      { markup: '<span data-id="plugin:fixture" data-keyword="Codex Native2" contenteditable="false">Codex Native2</span>',
+        identity: "data-id", replacement: "plugin:other" },
+      // Captured from the Free account composer on 2026-10-14. The display name
+      // is visible text but belongs to the plugin, not to the user's prompt.
+      { markup: '<span app-mention-path="app://fixture" app-mention-display-name="Clew review" contenteditable="false"><span>Clew review</span></span>',
+        identity: "app-mention-path", replacement: "app://other" },
+    ]) {
+      await page.setContent(`<form><div role="textbox" contenteditable="true"><p>${markup} </p></div>
+        <button type="button" aria-pressed="false">Think</button></form>
+        <script>document.querySelector('button').onclick = event => {
+          event.currentTarget.setAttribute('aria-pressed', String(event.currentTarget.getAttribute('aria-pressed') !== 'true'));
+        };</script>`);
+      const composer = page.getByRole("textbox");
+      const original = await composer.innerHTML();
+      await setChatGptThinkMode(composer, true);
+      expect(await page.getByRole("button", { name: "Think", exact: true }).getAttribute("aria-pressed")).toBe("true");
+      expect(await composer.innerHTML()).toBe(original);
+      await setChatGptThinkMode(composer, false);
+      await page.getByRole("button", { name: "Think", exact: true }).evaluate((element, change) => {
+        element.addEventListener("click", () => {
+          document.querySelector(`[${change.identity}]`)!.setAttribute(change.identity, change.replacement);
+        });
+      }, { identity, replacement });
+      // The name is unchanged: replacing the actual plugin must still fail.
+      const failure = await setChatGptThinkMode(composer, true).then(() => undefined, error => error);
+      expect(failure).toBeInstanceOf(Error);
+      expect(failure.message).toContain("did not preserve the empty draft and selected connectors");
+    }
+  } finally { await browser.close(); }
+}, 15_000);
+
 test.skipIf(!process.env.CHATGPT_DOM_TEST_BROWSER)("hidden duplicate Stop controls cannot turn live generation into an idle timeout", async () => {
   const browser = await chromium.launch({ executablePath: process.env.CHATGPT_DOM_TEST_BROWSER, headless: true });
   try {

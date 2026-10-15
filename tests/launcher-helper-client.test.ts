@@ -239,7 +239,7 @@ test("accepted compaction retires through the helper as completed without hiding
   }
 });
 
-test("launcher helper protocol preserves multipart context and the compaction flag", async () => {
+test("launcher helper protocol preserves multipart context, broker identity and the compaction flag", async () => {
   const sent: Record<string, unknown>[] = [];
   const client = new LauncherBrowserHelperClient({
     appName: "Codex Native2 DEV",
@@ -291,6 +291,7 @@ test("launcher helper protocol preserves multipart context and the compaction fl
     prepare: async () => ({
       text: "commit",
       images: [],
+      turnToken: "turn_0123456789abcdef0123456789abcdef",
       multipart: { parts: Array.from({ length: 6 }, (_, index) => JSON.stringify({ part: index + 1 })), commit: "commit" },
       trimmedCompactionMessages: 4,
       release() {},
@@ -308,6 +309,7 @@ test("launcher helper protocol preserves multipart context and the compaction fl
     type: "prepared_selected_ack",
     prepared: {
         text: "commit",
+        turnToken: "turn_0123456789abcdef0123456789abcdef",
         multipart: { parts: Array.from({ length: 6 }, (_, index) => JSON.stringify({ part: index + 1 })), commit: "commit" },
         trimmedCompactionMessages: 4,
     },

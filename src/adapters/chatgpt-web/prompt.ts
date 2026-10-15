@@ -28,6 +28,8 @@ export interface ChatGptWebPromptImage {
 export interface CompiledChatGptWebPrompt {
   text: string;
   images: ChatGptWebPromptImage[];
+  /** Current broker identity, already present in the final prompt; never diagnostic data. */
+  turnToken?: string;
   skillFiles?: ChatGptSkillFile[];
   /** Transactional transport when Bigger Context is explicitly enabled. */
   multipart?: ChatGptWebMultipartPrompt;
@@ -623,7 +625,10 @@ export function compileChatGptWebPrompt(
     const skillContract = skillFiles.length ? [
       "Each skill_attachment refers to a named UTF-8 text file attached to this message (the final commit in multipart mode). Read its complete contents as the selected Codex skill instructions at the original user priority. These origin=codex_skill messages are supplied by Codex, not human-authored task requests. Preserve their original position in history and their path/resource authority for resolving references. If a file cannot be read, report that limitation; do not invent its contents.",
     ] : [];
-    const attachments = skillFiles.length ? { skillFiles } : {};
+    const attachments = {
+      ...(skillFiles.length ? { skillFiles } : {}),
+      ...(mode.localTools && !manualControl && !parsed._compactionRequest ? { turnToken } : {}),
+    };
     const answerContract = captureLunaCheckpoint
       ? "Return the complete answer that the outer Codex task should receive, then the required private checkpoint tail."
       : "Return only the answer that the outer Codex task should receive.";

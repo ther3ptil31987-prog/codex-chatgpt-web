@@ -166,6 +166,101 @@ test.skipIf(!process.env.CHATGPT_DOM_TEST_BROWSER)("an exchange rekeys only with
   } finally { await browser.close(); }
 }, 30_000);
 
+test.skipIf(!process.env.CHATGPT_DOM_TEST_BROWSER)("collapsed plugin messages rebind only after their complete text is verified", async () => {
+  const browser = await chromium.launch({ executablePath: process.env.CHATGPT_DOM_TEST_BROWSER, headless: true });
+  try {
+    const worker = Object.create(ChatGptBrowserWorker.prototype) as any;
+    worker.config = { appName: "Clew review" };
+    const prompt = "Verify the entire message.\n\n" + "alpha  beta\n".repeat(1_000) + "END_MARKER";
+    // Structure captured in the DEV launcher on 2026-10-15. The user content is
+    // removed from the DOM when collapsed; the plugin and blank-line spans are real.
+    const render = (value: string) => '<div data-markdown-text-tone="user-message" class="rich-text-user-turn">'
+      + value.split("\n\n").map((paragraph, i) => (i ? '<span data-markdown-copy="blank-lines">\n</span>' : "")
+        + '<p>' + (i ? "" : '<a href="/plugins/fixture"><span data-prompt-link-href="app://fixture">Clew review</span></a>  ')
+        + paragraph.split("\n").map(line => `<span>${line}</span>`).join("<br>") + '</p>').join("") + '</div>';
+    for (const scenario of ["complete", "different-tail", "changed-spaces", "wrong-plugin", "still-truncated", "competing-turn"] as const) {
+      const page = await browser.newPage();
+      await page.setContent('<main></main>');
+      const baseline = await worker.captureSubmissionBaseline(page, prompt);
+      await page.locator('main').evaluate(e => { e.innerHTML = '<div data-turn-key="optimistic"><span hidden data-chatgpt-agent-turn-start></span></div>'; });
+      const binding = await worker.waitForNewAssistantTurn(page, baseline, Date.now() + 2_000);
+      const collapsed = render(prompt.slice(0, 10_000));
+      await page.locator('main').evaluate((e, html) => { e.innerHTML = html; }, `<div data-turn-key="persisted">
+        <div data-user-message-bubble><div data-search-result-target>${collapsed}</div>
+        <button type="button" aria-expanded="false" data-thread-find-skip="true" data-markdown-copy="exclude">Показать ещё</button></div>
+        <div data-conversation-role="assistant"></div><div data-markdown-text-style="assistant-message">Complete answer</div></div>`);
+      let expanded = render(scenario === "different-tail" ? prompt.replace("END_MARKER", "OTHER_TASK")
+        : scenario === "changed-spaces" ? prompt.replace("alpha  beta", "alpha beta")
+        : scenario === "still-truncated" ? prompt.slice(0, 10_000) : prompt);
+      if (scenario === "wrong-plugin") expanded = expanded.replace("Clew review", "Other plugin");
+      await page.locator('button').evaluate((button, { html, competing }) => {
+        button.addEventListener('click', () => {
+          button.setAttribute('aria-expanded', 'true');
+          button.parentElement!.querySelector('[data-search-result-target]')!.innerHTML = html;
+          if (competing) document.querySelector('main')!.insertAdjacentHTML('beforeend', '<div data-turn-key="other"><div data-user-message-bubble>Another task</div></div>');
+        });
+      }, { html: expanded, competing: scenario === "competing-turn" });
+      const result = await worker.reconcileAssistantTurnBinding(page, baseline, binding)
+        .then((value: unknown) => ({ value }), (error: Error) => ({ error }));
+      if (scenario === "complete") expect(result.value).toMatchObject({ identity: "group:assistant:persisted" });
+      else expect(result.error).toBeInstanceOf(Error);
+      await page.close();
+    }
+  } finally { await browser.close(); }
+}, 20_000);
+
+test.skipIf(!process.env.CHATGPT_DOM_TEST_BROWSER)("plain user code blocks preserve the full submitted code and whitespace", async () => {
+  const browser = await chromium.launch({ executablePath: process.env.CHATGPT_DOM_TEST_BROWSER, headless: true });
+  try {
+    const page = await browser.newPage();
+    const worker = Object.create(ChatGptBrowserWorker.prototype) as any;
+    const prompt = 'Literal header\n\n```json\n{"value":"a  b"}\n```\n\n\tEnd.';
+    // Captured plain user-message renderer: only fenced code becomes an HTML block.
+    await page.setContent('<div id="group"><div data-user-message-bubble><div data-search-result-target>'
+      + 'Literal header\n\n<pre data-markdown-copy="code-block"><code data-markdown-copy-content="true" data-language="json">{"value":"a  b"}</code></pre>\n\n\tEnd.</div></div></div>');
+    expect(await worker.userMessageMatchesSubmission(page.locator('#group'), prompt)).toBeTrue();
+    expect(await worker.userMessageMatchesSubmission(page.locator('#group'), prompt.replace('a  b', 'a b'))).toBeFalse();
+  } finally { await browser.close(); }
+});
+
+test.skipIf(!process.env.CHATGPT_DOM_TEST_BROWSER)("rich-text rebind requires the exact prepared turn token after expansion", async () => {
+  const browser = await chromium.launch({ executablePath: process.env.CHATGPT_DOM_TEST_BROWSER, headless: true });
+  try {
+    const worker = Object.create(ChatGptBrowserWorker.prototype) as any;
+    const token = "turn_0123456789abcdef0123456789abcdef";
+    const foreign = "turn_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const prompt = 'Task JSON with links.\nPass turn_token ' + token;
+    for (const scenario of ["matching", "foreign", "missing", "duplicate", "token-prefix", "competing-turn"] as const) {
+      const page = await browser.newPage();
+      await page.setContent('<main></main>');
+      const baseline = await worker.captureSubmissionBaseline(page, prompt, [], token);
+      await page.locator('main').evaluate(e => { e.innerHTML = '<div data-turn-key="pending"><span hidden data-chatgpt-agent-turn-start></span></div>'; });
+      const binding = await worker.waitForNewAssistantTurn(page, baseline, Date.now() + 2_000);
+      await page.locator('main').evaluate(e => { e.innerHTML = '<div data-turn-key="persisted"><div data-user-message-bubble>'
+        + '<div data-search-result-target><a data-search-result-target href="https://example.com">Altered JSON/link label</a></div>'
+        + '<button type="button" aria-expanded="false" data-thread-find-skip="true" data-markdown-copy="exclude">Afficher plus</button></div>'
+        + '<span hidden data-chatgpt-agent-turn-start></span></div>'; });
+      const displayed = scenario === "foreign" ? foreign : scenario === "missing" ? ""
+        : scenario === "duplicate" ? `${token} ${token}` : scenario === "token-prefix" ? `${token}extra` : token;
+      await page.locator('button').evaluate((button, { displayed, competing }) => {
+        button.addEventListener('click', () => {
+          button.setAttribute('aria-expanded', 'true');
+          button.parentElement!.querySelector('[data-search-result-target]')!.append(' Pass turn_token ' + displayed);
+          if (competing) document.querySelector('main')!.insertAdjacentHTML('beforeend', '<div data-turn-key="other"><div data-user-message-bubble>Other task</div></div>');
+        });
+      }, { displayed, competing: scenario === "competing-turn" });
+      const result = await worker.reconcileAssistantTurnBinding(page, baseline, binding)
+        .then((value: unknown) => ({ value }), (error: Error) => ({ error }));
+      if (scenario === "matching") expect(result.value).toMatchObject({ identity: "group:assistant:persisted" });
+      else expect(result.error).toBeInstanceOf(Error);
+      const invalid = await worker.captureSubmissionBaseline(page, "No broker token here", [], token)
+        .then(() => undefined, (error: Error) => error);
+      expect(invalid).toBeInstanceOf(Error);
+      await page.close();
+    }
+  } finally { await browser.close(); }
+}, 20_000);
+
 test.skipIf(!process.env.CHATGPT_DOM_TEST_BROWSER)("binds captured Activity before an answer exists and recognizes uploaded native-button tiles", async () => {
   const server = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: request => new URL(request.url).pathname === "/backend-api/files/process_upload_stream"
     ? new Response(JSON.stringify({ event: "file.processing.completed", file_id: "fixture-file" }) + "\n", { headers: { "content-type": "application/x-ndjson" } })

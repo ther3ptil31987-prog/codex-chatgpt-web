@@ -126,24 +126,27 @@ function authority(environment: ChatGptTurnEnvironment, updatedAt: number): Stor
   };
 }
 
-function sameAuthority(claim: ChatGptEnvironmentClaim, right: ChatGptTurnEnvironment, allowAdditionalWritableRoots = false): boolean {
+function conflictingAuthorityFields(claim: ChatGptEnvironmentClaim, right: ChatGptTurnEnvironment): string[] {
   const left = claim.environment;
   const samePaths = (a: string[], b: string[]): boolean => {
     const expected = new Set(b.map(pathIdentity));
     return a.length === expected.size && a.every(path => expected.has(pathIdentity(path)));
   };
-  return pathIdentity(left.cwd) === pathIdentity(right.cwd)
-    && samePaths(left.roots, right.roots)
-    // Filesystem envelopes can omit Codex's extra output directories. The current
-    // native rollout remains the authority returned to the caller, never the claim.
-    && (allowAdditionalWritableRoots
-      ? left.writableRoots.every(path => right.writableRoots.some(root => pathIdentity(root) === pathIdentity(path)))
-      : samePaths(left.writableRoots, right.writableRoots))
-    && left.sandboxPolicy.type === right.sandboxPolicy.type
-    // An envelope that does not state its network policy cannot contradict the rollout on it.
-    && (left.sandboxPolicy.type === "dangerFullAccess" || !claim.statesNetworkAccess
-      || (right.sandboxPolicy.type !== "dangerFullAccess"
-        && left.sandboxPolicy.networkAccess === right.sandboxPolicy.networkAccess));
+  const fields: string[] = [];
+  if (pathIdentity(left.cwd) !== pathIdentity(right.cwd)) fields.push("cwd");
+  if (!samePaths(left.roots, right.roots)) fields.push("workspace_roots");
+  // Filesystem envelopes omit Codex's extra output directories, including after
+  // compaction. Only the current native rollout supplies the returned grants.
+  if (!left.writableRoots.every(path => right.writableRoots.some(root => pathIdentity(root) === pathIdentity(path)))) {
+    fields.push("writable_roots");
+  }
+  if (left.sandboxPolicy.type !== right.sandboxPolicy.type) fields.push("sandbox_policy");
+  // An envelope that does not state its network policy cannot contradict the rollout on it.
+  if (left.sandboxPolicy.type !== "dangerFullAccess" && right.sandboxPolicy.type !== "dangerFullAccess"
+    && claim.statesNetworkAccess && left.sandboxPolicy.networkAccess !== right.sandboxPolicy.networkAccess) {
+    fields.push("network_access");
+  }
+  return fields;
 }
 
 /**
@@ -216,9 +219,13 @@ export class ChatGptThreadEnvironmentStore {
               throw new Error("Calendar environment delta conflicts with its current Codex rollout");
             }
           }
-          if (currentClaim && !sameAuthority(currentClaim, rolloutEnvironment, initialClaim !== undefined || steeringClaim !== undefined)) {
+          const conflicts = currentClaim ? conflictingAuthorityFields(currentClaim, rolloutEnvironment) : [];
+          if (conflicts.length > 0) {
             const source = currentCompaction ? "Compaction continuation" : initialClaim ? "Current" : "Steering";
-            throw new Error(`${source} environment conflicts with its current Codex rollout`);
+            // Field names are safe to export; paths, request text and permission
+            // contents are deliberately excluded from both the log and UI error.
+            console.warn(`[chatgpt-web] trusted environment conflict (source=${source}, fields=${conflicts.join(",")})`);
+            throw new Error(`${source} environment conflicts with its current Codex rollout (fields: ${conflicts.join(", ")})`);
           }
           this.set(rolloutIdentity.threadId, rolloutEnvironment);
           return rolloutEnvironment;
