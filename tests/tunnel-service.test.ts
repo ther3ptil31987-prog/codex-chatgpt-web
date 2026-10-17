@@ -73,6 +73,7 @@ describe("tunnel launchd ownership", () => {
     expect(definition).toContain(`<string>${config.tunnel.profileDir}</string>`);
     expect(definition).toContain("<key>RunAtLoad</key>\n  <true/>");
     expect(definition).toContain("<key>KeepAlive</key>\n  <true/>");
+    expect(definition).toContain("<key>MCP_STDIO_SEND_INITIALIZED_NOTIFICATION</key>\n    <string>true</string>");
     expect(definition).not.toContain("tmux");
     expect(definition).not.toContain("/bin/sh");
     expect(definition).not.toContain(config.tunnel.tunnelId);

@@ -3111,12 +3111,11 @@ export class ChatGptBrowserWorker {
       // not exist yet. Inspect the existing group; waiting for an assistant here turns
       // normal response startup into repeated DOM observation timeouts.
       const locator = page.locator(`[data-turn-key=${JSON.stringify(identity.slice("group:assistant:".length))}]`);
-      const text = await withChatGptBrowserObservationTimeout(withBrowserTurnAbort(locator.evaluate(group => {
-        const bubbles = group.querySelectorAll<HTMLElement>("[data-user-message-bubble]");
-        const contents = bubbles.length === 1
-          ? bubbles[0]!.querySelectorAll<HTMLElement>("[data-search-result-target]") : [];
-        return contents.length === 1 ? contents[0]!.innerText.replace(/\r\n?/g, "\n") : undefined;
-      }), signal));
+      const content = await this.expandedUserMessageContent(locator, signal);
+      const observed = content && await withChatGptBrowserObservationTimeout(withBrowserTurnAbort(
+        content.evaluate(readChatGptUserMessage), signal,
+      ));
+      const text = observed?.text.replace(/\r\n?/g, "\n");
       // Only this transaction's already completed stages may acquire a new identity. A
       // matching acknowledgement alone cannot prove that the uploaded context survived.
       const snapshot = await this.responseDomSnapshot(locator, {});
@@ -3125,6 +3124,13 @@ export class ChatGptBrowserWorker {
       if (!stage && !ackStage) continue;
       if (!stage || stage !== ackStage || !snapshot.completionActionVisible) {
         throw new Error("ChatGPT changed an acknowledged Bigger Context exchange");
+      }
+      // Expanding the message yields to the page. A concurrent new/duplicated turn
+      // must not disappear from the caller's earlier submission snapshot.
+      const current = await this.submissionDomState(page, baseline.domCache, signal);
+      if (current.turnIdentities.length !== state.turnIdentities.length
+        || current.turnIdentities.some(turn => !state.turnIdentities.includes(turn))) {
+        throw new Error("ChatGPT changed conversation turns while verifying an acknowledged Bigger Context exchange");
       }
       if (stage.identities.some(previous => state.turnIdentities.includes(previous))) {
         throw new Error("ChatGPT duplicated an acknowledged Bigger Context exchange");
@@ -3344,24 +3350,30 @@ export class ChatGptBrowserWorker {
     };
   }
 
-  private async userMessageMatchesSubmission(group: Locator, submitted: string, signal?: AbortSignal, turnToken?: string): Promise<boolean> {
+  private async expandedUserMessageContent(group: Locator, signal?: AbortSignal): Promise<Locator | undefined> {
     const bubble = group.locator("[data-user-message-bubble]");
-    if (await bubble.count() !== 1) return false;
+    if (await bubble.count() !== 1) return undefined;
     // Inline links have their own search targets. Only the outer message target
     // identifies the complete user content.
     const content = bubble.locator("[data-search-result-target]:not([data-search-result-target] [data-search-result-target])");
-    if (await content.count() !== 1) return false;
+    if (await content.count() !== 1) return undefined;
     // Captured on 2026-10-15: long messages are truncated in the DOM, not just
     // clipped by CSS. Expand the message using its semantic control in any locale.
     const expand = bubble.locator('button[type="button"][aria-expanded][data-thread-find-skip="true"][data-markdown-copy="exclude"]');
     const count = await expand.count();
-    if (count > 1) return false;
+    if (count > 1) return undefined;
     if (count === 1 && await expand.getAttribute("aria-expanded") === "false") {
       await expand.press("Enter", { signal, timeout: CHATGPT_CONNECTOR_ACTION_TIMEOUT_MS });
       await expand.locator('xpath=self::*[@aria-expanded="true"]').waitFor({
         state: "attached", signal, timeout: CHATGPT_CONNECTOR_ACTION_TIMEOUT_MS,
       });
     }
+    return content;
+  }
+
+  private async userMessageMatchesSubmission(group: Locator, submitted: string, signal?: AbortSignal, turnToken?: string): Promise<boolean> {
+    const content = await this.expandedUserMessageContent(group, signal);
+    if (!content) return false;
     if (turnToken !== undefined) {
       // The composer was already checked byte-for-byte before Send. ChatGPT's
       // rich-text renderer can rewrite JSON/link labels afterwards, so use the

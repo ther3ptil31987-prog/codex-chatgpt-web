@@ -127,6 +127,13 @@ test("managed startup wires PAC into connect and never spawns after resolution f
     assert.equal(args[args.indexOf("--control-plane-base-url") + 1], "https://api.openai.com");
     assert.equal(env.HTTPS_PROXY, "http://proxy.example:8080/");
     assert.equal(process.env.HTTPS_PROXY, undefined);
+    const parentSetting = process.env.MCP_STDIO_SEND_INITIALIZED_NOTIFICATION;
+    const probe = await RuntimeSupervisor.prototype.runTunnelCommand.call(supervisor,
+      _config, ["-e", "console.log(process.env.MCP_STDIO_SEND_INITIALIZED_NOTIFICATION)"],
+      5_000, "initialization setting probe", env);
+    assert.equal(probe.code, 0);
+    assert.equal(probe.stdout.trim(), "true");
+    assert.equal(process.env.MCP_STDIO_SEND_INITIALIZED_NOTIFICATION, parentSetting);
     return { code: 0 };
   };
   const config = { brokerSocketPath: "broker", tunnel: {

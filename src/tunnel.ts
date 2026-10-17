@@ -283,7 +283,11 @@ export function connectTunnel(config: AppConfig): void {
     "--runtime-api-key", `file:${settings.runtimeKeyFile}`,
     "--mcp-command", mcpCommand(config),
     "--json",
-  ], { timeout: TUNNEL_READY_TIMEOUT_MS });
+  ], {
+    timeout: TUNNEL_READY_TIMEOUT_MS,
+    // Finish initialization before another chat can call the shared MCP server.
+    env: { ...process.env, MCP_STDIO_SEND_INITIALIZED_NOTIFICATION: "true" },
+  });
   const structuredOutput = result.stdout.trim();
   const launchError = structuredOutput
     ? tunnelConnectLaunchError(structuredOutput)

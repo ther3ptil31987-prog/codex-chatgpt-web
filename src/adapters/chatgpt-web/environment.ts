@@ -1,6 +1,7 @@
 import { homedir } from "node:os";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import { isReadableCompactionSummaryText, OPAQUE_COMPACTION_NOTE } from "../../responses/compaction";
+import { isNativeAgentsMdContext } from "../../responses/native-context";
 import type { CodexContentPart, CodexParsedRequest, CodexTool } from "../../types";
 import { isAcceptedCompactionContinuation, recoverCompactionInstruction } from "./compaction-continuation";
 
@@ -179,6 +180,7 @@ export function unattributedChatGptEnvironmentMessages(
 function contextualUserMessage(value: Record<string, unknown>): boolean {
   const text = rawMessageText(value).trim();
   return hasEnvironmentContextFragment(value)
+    || isNativeAgentsMdContext(value)
     || isNativeOpenPageContext(value)
     || /^<subagent_notification>[\s\S]*<\/subagent_notification>$/.test(text)
     || isReadableCompactionSummaryText(text)
@@ -278,15 +280,23 @@ export function extractChatGptTurnUserRevision(parsed: CodexParsedRequest): unkn
   return revision.content;
 }
 
-function latestChatGptTurnUserRevision(parsed: CodexParsedRequest, expectedTurnId?: string): ChatGptTurnUserRevision | undefined {
+function latestChatGptTurnUserRevision(parsed: CodexParsedRequest, expectedTurnId?: string, recoverCheckpoint = true): ChatGptTurnUserRevision | undefined {
   const body = record(parsed._rawBody);
   const input = Array.isArray(body?.input) ? body.input : [];
   const metadata = clientTurnMetadata(parsed);
+  const recovered = recoverCheckpoint ? recoverCompactionInstruction(parsed, extractChatGptTurnIdentity(parsed)) : undefined;
   for (let index = input.length - 1; index >= 0; index -= 1) {
     const revision = userRevision(input[index], expectedTurnId, metadata);
-    if (revision) return revision;
+    if (revision) {
+      // v1 retains the older human message but drops a synthetic delegation. Recover the
+      // actual task only for an exact producer-authenticated retained representation before
+      // our checkpoint. New steering and rewritten history keep their normal validation.
+      return recovered?.sourceWasDelegation && index < recovered.summaryIndex
+        && isAcceptedCompactionContinuation(parsed, extractChatGptTurnIdentity(parsed), revision)
+        ? recovered.source : revision;
+    }
   }
-  return recoverCompactionInstruction(parsed, extractChatGptTurnIdentity(parsed))?.source;
+  return recovered?.source;
 }
 
 function userRevision(value: unknown, expectedTurnId?: string, metadata?: Record<string, unknown>): ChatGptTurnUserRevision | undefined {
@@ -308,19 +318,27 @@ export function chatGptTurnUserRevisionHistory(parsed: CodexParsedRequest): Chat
   const body = record(parsed._rawBody);
   const turnId = extractChatGptTurnIdentity(parsed).turnId;
   const metadata = clientTurnMetadata(parsed);
-  const revisions = (Array.isArray(body?.input) ? body.input : []).flatMap(value => {
+  const recovered = recoverCompactionInstruction(parsed, extractChatGptTurnIdentity(parsed));
+  const input = Array.isArray(body?.input) ? body.input : [];
+  const prefix = recovered?.sourceWasDelegation ? input.slice(0, recovered.summaryIndex) : [];
+  const retained = prefix.map(value => userRevision(value, turnId, metadata)).filter(value => value !== undefined).at(-1);
+  const recoverDelegation = recovered?.sourceWasDelegation && (!retained
+    || isAcceptedCompactionContinuation(parsed, extractChatGptTurnIdentity(parsed), retained));
+  const revisions = input.slice(recoverDelegation ? recovered!.summaryIndex + 1 : 0).flatMap(value => {
     const revision = userRevision(value, turnId, metadata);
     return revision ? [revision] : [];
   });
-  if (revisions.length > 0) return revisions;
-  const recovered = recoverCompactionInstruction(parsed, extractChatGptTurnIdentity(parsed));
-  return recovered ? [recovered.source] : [];
+  if (recoverDelegation) return [recovered!.source, ...revisions];
+  return revisions.length > 0 ? revisions : recovered ? [recovered.source] : [];
 }
 
 /** A remote compaction may summarize an instruction from an earlier turn. */
-export function extractChatGptCompactionSourceRevision(parsed: CodexParsedRequest): ChatGptTurnUserRevision {
+export function extractChatGptCompactionSourceRevision(
+  parsed: CodexParsedRequest,
+  options: { recoverCheckpoint?: boolean } = {},
+): ChatGptTurnUserRevision {
   if (!parsed._compactionRequest) throw new Error("ChatGPT web compaction source requires a compaction request");
-  const revision = latestChatGptTurnUserRevision(parsed, extractChatGptTurnIdentity(parsed).turnId);
+  const revision = latestChatGptTurnUserRevision(parsed, extractChatGptTurnIdentity(parsed).turnId, options.recoverCheckpoint !== false);
   if (!revision) throw new Error("ChatGPT web compaction requires a source user message");
   return revision;
 }
@@ -443,7 +461,9 @@ export function extractChatGptCalendarEnvironmentDelta(parsed: CodexParsedReques
     const text = rawMessageText(item).trim();
     // Match the whole native fragment, not just the presence of a disabled profile: another
     // profile, a malformed cwd, or any additional permission declaration must fail closed.
-    const match = /^<environment_context>\s*<current_date>\d{4}-\d{2}-\d{2}<\/current_date>\s*(?:<timezone>[^<>]+<\/timezone>\s*)?<filesystem>\s*(?:<workspace_roots>((?:\s*<root>[^<>]+<\/root>\s*)+)<\/workspace_roots>\s*)?<permission_profile type="disabled">\s*<file_system type="unrestricted"\s*\/>\s*<\/permission_profile>\s*<\/filesystem>\s*<\/environment_context>$/.exec(text);
+    // Native midnight updates can also repeat a worker inventory. Its exact name-only
+    // shape is contextual; it grants neither filesystem authority nor child ownership.
+    const match = /^<environment_context>\s*<current_date>\d{4}-\d{2}-\d{2}<\/current_date>\s*(?:<timezone>[^<>]+<\/timezone>\s*)?<filesystem>\s*(?:<workspace_roots>((?:\s*<root>[^<>]+<\/root>\s*)+)<\/workspace_roots>\s*)?<permission_profile type="disabled">\s*<file_system type="unrestricted"\s*\/>\s*<\/permission_profile>\s*<\/filesystem>\s*(?:<subagents>\s*(?:<agent name="[^<>"\r\n]+"\s*\/>\s*)*<\/subagents>\s*)?<\/environment_context>$/.exec(text);
     if (!match
       || !sandboxMetadataMatchesEnvironment(canonicalSandboxMetadata(metadata), text)
       || [metadata.sandbox_mode, metadata.sandbox].some(value => (

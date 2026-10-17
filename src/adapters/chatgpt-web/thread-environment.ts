@@ -128,13 +128,16 @@ function authority(environment: ChatGptTurnEnvironment, updatedAt: number): Stor
 
 function conflictingAuthorityFields(claim: ChatGptEnvironmentClaim, right: ChatGptTurnEnvironment): string[] {
   const left = claim.environment;
-  const samePaths = (a: string[], b: string[]): boolean => {
-    const expected = new Set(b.map(pathIdentity));
-    return a.length === expected.size && a.every(path => expected.has(pathIdentity(path)));
-  };
+  const claimedRoots = new Set(left.roots.map(pathIdentity));
+  const nativeRoots = new Set(right.roots.map(pathIdentity));
+  const nativeGrants = new Set([...right.roots, ...right.writableRoots].map(pathIdentity));
   const fields: string[] = [];
   if (pathIdentity(left.cwd) !== pathIdentity(right.cwd)) fields.push("cwd");
-  if (!samePaths(left.roots, right.roots)) fields.push("workspace_roots");
+  // Codex 0.163 omits workspace_roots in some rollouts while its envelope still
+  // lists output directories. Every extra claimed root must be an exact native
+  // grant, and no native workspace may disappear. Return only native authority.
+  if ([...nativeRoots].some(root => !claimedRoots.has(root))
+    || [...claimedRoots].some(root => !nativeGrants.has(root))) fields.push("workspace_roots");
   // Filesystem envelopes omit Codex's extra output directories, including after
   // compaction. Only the current native rollout supplies the returned grants.
   if (!left.writableRoots.every(path => right.writableRoots.some(root => pathIdentity(root) === pathIdentity(path)))) {

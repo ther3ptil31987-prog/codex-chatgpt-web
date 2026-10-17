@@ -6,7 +6,36 @@ import { join } from "node:path";
 import { zipSync } from "fflate";
 import * as config from "../src/config";
 import * as commands from "../src/process";
-import { TUNNEL_VERSION, installTunnelClient, parseTunnelStatus, stopTunnel, tunnelClientInstallAction, tunnelCommandOutput, tunnelConnectLaunchError } from "../src/tunnel";
+import { TUNNEL_VERSION, connectTunnel, createTunnelConfig, installTunnelClient, parseTunnelStatus, stopTunnel, tunnelClientInstallAction, tunnelCommandOutput, tunnelConnectLaunchError } from "../src/tunnel";
+
+test("native connect completes shared MCP initialization without changing the parent environment", () => {
+  const root = fs.mkdtempSync(join(tmpdir(), "tunnel-connect-"));
+  const home = spyOn(config, "getConfigDir").mockReturnValue(root);
+  const parentSetting = process.env.MCP_STDIO_SEND_INITIALIZED_NOTIFICATION;
+  const command = spyOn(commands, "runCommand").mockImplementation((_binary, args, options) => {
+    expect(args.slice(0, 2)).toEqual(["runtimes", "connect"]);
+    expect(options?.env).toEqual({ ...process.env, MCP_STDIO_SEND_INITIALIZED_NOTIFICATION: "true" });
+    return { status: 0, stdout: JSON.stringify({ running: true, healthy: true }), stderr: "" };
+  });
+  try {
+    process.env.MCP_STDIO_SEND_INITIALIZED_NOTIFICATION = "false";
+    const appConfig = config.defaultConfig("full");
+    appConfig.tunnel = createTunnelConfig({ binaryPath: process.execPath,
+      runtimeKeyFile: join(root, "key"), tunnelId: `tunnel_${"a".repeat(32)}` });
+    for (const mode of ["automatic", "manual"] as const) {
+      appConfig.browserInteractionMode = mode;
+      connectTunnel(appConfig);
+      expect(process.env.MCP_STDIO_SEND_INITIALIZED_NOTIFICATION).toBe("false");
+    }
+    expect(command).toHaveBeenCalledTimes(2);
+  } finally {
+    command.mockRestore();
+    home.mockRestore();
+    if (parentSetting === undefined) delete process.env.MCP_STDIO_SEND_INITIALIZED_NOTIFICATION;
+    else process.env.MCP_STDIO_SEND_INITIALIZED_NOTIFICATION = parentSetting;
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
 
 test("a failed tunnel stop trusts OS exit evidence, never the inventory's cleared PID", () => {
   const appConfig = { mode: "full", tunnel: { binaryPath: process.execPath, alias: "ours" } } as config.AppConfig;

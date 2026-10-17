@@ -7,6 +7,7 @@ interface CompletedCheckpoint {
   summaryHash: string;
   sourceHashes: ReadonlySet<string>;
   source: ChatGptTurnUserRevision;
+  sourceWasDelegation: boolean;
 }
 
 // Evidence of a checkpoint actually returned by this daemon, not authority inferred from text
@@ -35,10 +36,23 @@ export function rememberCompactionContinuation(
 ): void {
   const key = scope(parsed, identity);
   if (!key || !parsed._compactionRequest || !summary || !sources[0]) return;
+  const input = (parsed._rawBody as { input?: Array<Record<string, unknown>> } | undefined)?.input;
+  const previous = recoverCompactionInstruction(parsed, identity);
+  // Source extraction has already authenticated this synthetic native instruction. Unlike
+  // human messages, function-call outputs are not retained by the v1 compaction producer.
+  const sourceWasDelegation = sources[0].itemId !== undefined && Array.isArray(input)
+    && input.some(item => item?.id === sources[0]!.itemId && item.type === "function_call_output"
+      && item.name === "send_message_to_thread" && item.namespace === "codex_app" && item.call_id === undefined
+      && item.output === sources[0]!.content)
+    // Later compactions no longer contain the synthetic item. Carry its provenance only
+    // through an exact earlier completed checkpoint, never a newer steering instruction.
+    || previous?.sourceWasDelegation === true && previous.source.itemId === sources[0].itemId
+      && sourceDigest(previous.source) === sourceDigest(sources[0]);
   checkpoints.delete(key);
   checkpoints.set(key, {
     summaryHash: digest(summary), sourceHashes: new Set(sources.map(sourceDigest)),
     source: structuredClone(sources[0]),
+    sourceWasDelegation,
   });
   while (checkpoints.size > MAX_CHECKPOINTS) checkpoints.delete(checkpoints.keys().next().value!);
 }
@@ -55,9 +69,12 @@ export function isAcceptedCompactionContinuation(
 export function recoverCompactionInstruction(
   parsed: CodexParsedRequest,
   identity: ChatGptTurnIdentity,
-): { source: ChatGptTurnUserRevision; summaryIndex: number } | undefined {
+): { source: ChatGptTurnUserRevision; summaryIndex: number; sourceWasDelegation: boolean } | undefined {
   const accepted = acceptedCheckpoint(parsed, identity);
-  return accepted ? { source: structuredClone(accepted.checkpoint.source), summaryIndex: accepted.summaryIndex } : undefined;
+  return accepted ? {
+    source: structuredClone(accepted.checkpoint.source), summaryIndex: accepted.summaryIndex,
+    sourceWasDelegation: accepted.checkpoint.sourceWasDelegation,
+  } : undefined;
 }
 
 function acceptedCheckpoint(
