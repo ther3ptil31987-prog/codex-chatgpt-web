@@ -290,12 +290,16 @@ test("conversation preferences survive reload; saved chats also apply to Zero Ri
   const config: Record<string, unknown> = { ...defaultConfig("browser-only") };
   const persist = () => writeFileSync(join(root, "config.json"), JSON.stringify(config));
   expect(config.experimentalFreshConversationPerTurn).toBe(false);
-  expect(config.useSavedChats).toBe(false);
+  expect(config.useSavedChats).toBe(true);
   delete config.useSavedChats;
   delete config.experimentalFreshConversationPerTurn;
   persist();
   expect(loadConfig()!.experimentalFreshConversationPerTurn).toBe(false);
-  expect(loadConfig()!.useSavedChats).toBe(false);
+  expect(loadConfig()!.useSavedChats).toBe(true);
+  config.useSavedChats = false;
+  persist();
+  expect(loadConfigForSetup().useSavedChats).toBe(false);
+  expect(providerConfig(loadConfig()!).chatgptWeb!.useSavedChats).toBe(false);
   config.useSavedChats = true;
   config.experimentalFreshConversationPerTurn = true;
   persist();

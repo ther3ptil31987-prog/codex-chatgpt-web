@@ -108,11 +108,18 @@ export const CHATGPT_USER_TURN_SELECTOR = [
 ].join(", ");
 
 /** The new renderer groups both roles under the user's stable turn key. */
-export function chatGptAssistantTurnSelector(identity: string): string {
+export function chatGptTurnContainerSelector(identity: string): string {
   const prefix = "group:assistant:";
   return identity.startsWith(prefix)
-    ? `[data-turn-key=${JSON.stringify(identity.slice(prefix.length))}]:has([data-conversation-role="assistant"], [data-chatgpt-agent-turn-start])`
+    ? `[data-turn-key=${JSON.stringify(identity.slice(prefix.length))}]`
     : `[data-turn-id=${JSON.stringify(identity)}]`;
+}
+
+export function chatGptAssistantTurnSelector(identity: string): string {
+  const container = chatGptTurnContainerSelector(identity);
+  return identity.startsWith("group:assistant:")
+    ? `${container}:has([data-conversation-role="assistant"], [data-chatgpt-agent-turn-start])`
+    : container;
 }
 
 export interface ChatGptEffortSliderState {

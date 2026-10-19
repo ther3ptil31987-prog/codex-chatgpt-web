@@ -3,6 +3,7 @@ import { existsSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { observeChatGptAttachmentUploads } from "./attachment-upload";
 import { chatGptResponseStructureLogEntries, chatGptResponseStructures } from "./browser-response-structure";
+import { chatGptInteractionState } from "./browser-interaction-state";
 import { BrowserDiagnosticHistory } from "./browser-diagnostic-history";
 import { readChatGptUserMessage } from "./browser-user-message";
 import { skillFileTokens, validateSkillFiles } from "./skill-attachments";
@@ -55,6 +56,7 @@ import {
   assertNewChatPage,
   chatGptNewChatUrl,
   chatGptAssistantTurnSelector,
+  chatGptTurnContainerSelector,
   CHATGPT_ASSISTANT_TURN_SELECTOR,
   CHATGPT_COMPLETION_ACTION_SELECTOR,
   CHATGPT_COMPOSER_SELECTOR,
@@ -1952,7 +1954,8 @@ class ChatGptBrowserDiagnostics {
       const sequence = String(++this.sequence).padStart(2, "0");
       const stem = `${sequence}-${browserDiagnosticCheckpoint(checkpoint)}`;
       const includeScreenshot = process.env.CODEX_CHATGPT_WEB_BROWSER_DIAGNOSTICS === "1";
-      const [screenshotResult, stateResult, structureResult] = await Promise.allSettled([
+      const failed = /turn-failed|response-stalled/.test(checkpoint);
+      const [screenshotResult, stateResult, structureResult, interactionResult] = await Promise.allSettled([
         includeScreenshot
           ? page.screenshot({ animations: "disabled", caret: "hide", timeout: 5_000, type: "png" })
           : Promise.resolve(undefined),
@@ -2120,6 +2123,10 @@ class ChatGptBrowserDiagnostics {
             '[data-turn-key], [data-testid^="conversation-turn-"]:not([data-turn-key] *)',
           ).evaluateAll(chatGptResponseStructures)),
         ),
+        withChatGptBrowserObservationTimeout(page.evaluate(chatGptInteractionState, {
+          selector: CHATGPT_EFFORT_CONTROL_SELECTOR,
+          sampleFrames: failed,
+        })),
       ]);
       const capturedAt = new Date().toISOString();
       if (screenshotResult.status === "fulfilled" && screenshotResult.value) {
@@ -2127,6 +2134,7 @@ class ChatGptBrowserDiagnostics {
       }
       const captureErrors = Object.fromEntries([
         ...(structureResult.status === "rejected" ? [["responseStructure", "unavailable"]] : []),
+        ...(interactionResult.status === "rejected" ? [["interaction", "unavailable"]] : []),
         ...(screenshotResult.status === "rejected" ? [[
           "screenshot",
           redactChatGptUiDiagnostic(
@@ -2154,9 +2162,20 @@ class ChatGptBrowserDiagnostics {
         ...(structureResult.status === "fulfilled"
           ? { responseStructure: sanitizeChatGptBrowserDiagnosticState(structureResult.value) }
           : {}),
+        ...(interactionResult.status === "fulfilled"
+          ? { interaction: sanitizeChatGptBrowserDiagnosticState(interactionResult.value) }
+          : {}),
         ...(Object.keys(captureErrors).length > 0 ? { captureErrors } : {}),
       }, null, 2)}\n`);
-      if (structureResult.status === "fulfilled" && /turn-failed|response-stalled/.test(checkpoint)) {
+      if (failed) {
+        console.info(`[chatgpt-web] interaction_state ${JSON.stringify({
+          traceId: this.traceId, checkpoint: stem,
+          ...(interactionResult.status === "fulfilled"
+            ? { state: sanitizeChatGptBrowserDiagnosticState(interactionResult.value) }
+            : { unavailable: true }),
+        })}`);
+      }
+      if (structureResult.status === "fulfilled" && failed) {
         // Carry the bounded, content-free tree into Activity → Export safe log as well. The
         // failing renderer may have been replaced by the time the reporter opens its tab.
         for (const entry of chatGptResponseStructureLogEntries(this.traceId, stem, structureResult.value)) {
@@ -3111,6 +3130,17 @@ export class ChatGptBrowserWorker {
       // not exist yet. Inspect the existing group; waiting for an assistant here turns
       // normal response startup into repeated DOM observation timeouts.
       const locator = page.locator(`[data-turn-key=${JSON.stringify(identity.slice("group:assistant:".length))}]`);
+      const snapshot = await this.responseDomSnapshot(locator, {});
+      const ackStage = stages.find(candidate => candidate.acknowledgement === snapshot.visibleText.trim());
+      // When every acknowledged stage still has its known identity, an unfinished
+      // new group needs no history rebind. Its transient user bubble can disappear
+      // into Activity immediately after Send; expanding it here blocks acceptance
+      // on a control that ChatGPT has already removed. Completed exchanges and
+      // previous acknowledgements still undergo the full duplicate/content checks.
+      if (!snapshot.completionActionVisible && !ackStage
+        && stages.every(stage => stage.identities.some(previous => state.turnIdentities.includes(previous)))) {
+        continue;
+      }
       const content = await this.expandedUserMessageContent(locator, signal);
       const observed = content && await withChatGptBrowserObservationTimeout(withBrowserTurnAbort(
         content.evaluate(readChatGptUserMessage), signal,
@@ -3118,11 +3148,11 @@ export class ChatGptBrowserWorker {
       const text = observed?.text.replace(/\r\n?/g, "\n");
       // Only this transaction's already completed stages may acquire a new identity. A
       // matching acknowledgement alone cannot prove that the uploaded context survived.
-      const snapshot = await this.responseDomSnapshot(locator, {});
+      const verifiedSnapshot = await this.responseDomSnapshot(locator, {});
       const stage = stages.find(candidate => candidate.text.replace(/\r\n?/g, "\n") === text);
-      const ackStage = stages.find(candidate => candidate.acknowledgement === snapshot.visibleText.trim());
-      if (!stage && !ackStage) continue;
-      if (!stage || stage !== ackStage || !snapshot.completionActionVisible) {
+      const verifiedAckStage = stages.find(candidate => candidate.acknowledgement === verifiedSnapshot.visibleText.trim());
+      if (!stage && !verifiedAckStage) continue;
+      if (!stage || stage !== verifiedAckStage || !verifiedSnapshot.completionActionVisible) {
         throw new Error("ChatGPT changed an acknowledged Bigger Context exchange");
       }
       // Expanding the message yields to the page. A concurrent new/duplicated turn
@@ -3965,7 +3995,9 @@ export class ChatGptBrowserWorker {
         throw new Error("ChatGPT Bigger Context transaction timed out while awaiting a stage acknowledgement");
       }
       await throwIfChatGptSessionFailureAlert(page);
-      await throwIfChatGptTerminalErrorAlert(responseTurn.locator);
+      // ChatGPT can replace the assistant subtree with an error. Its owning turn
+      // remains valid even though the answer-only locator no longer matches.
+      await throwIfChatGptTerminalErrorAlert(page.locator(chatGptTurnContainerSelector(responseTurn.identity)));
       let snapshot = await this.responseDomSnapshot(responseTurn.locator, responseDomCache);
       if (!snapshot.responsePresent && await responseTurn.locator.count() !== 1) {
         const rebound = await this.reconcileAssistantTurnBinding(
@@ -4157,7 +4189,7 @@ export class ChatGptBrowserWorker {
     let completed = false;
     try {
       await captureDiagnostic("connector-verification-started");
-      await this.prepareChatSurface(page, captureDiagnostic);
+      await this.prepareChatSurface(page, captureDiagnostic, this.config.useSavedChats);
       // The launcher refreshes its owned ChatGPT document before starting this helper. A second
       // reload here can discard the first catalog's exact mismatch evidence and report a generic
       // menu failure instead of identifying the connector the account actually exposes.
@@ -5707,7 +5739,7 @@ export class ChatGptBrowserWorker {
           throw new Error("ChatGPT web turn timed out");
         }
         await throwIfChatGptSessionFailureAlert(page);
-        await throwIfChatGptTerminalErrorAlert(responseTurn.locator);
+        await throwIfChatGptTerminalErrorAlert(page.locator(chatGptTurnContainerSelector(responseTurn.identity)));
 
         if (mode.localTools && await resolveChatGptToolConfirmation(
           page,

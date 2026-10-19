@@ -1,7 +1,7 @@
 import { existsSync, readFileSync, renameSync } from "node:fs";
 import { isAbsolute, relative, resolve } from "node:path";
 import { atomicWriteFile } from "../../config";
-import { getCodexHome } from "../../codex-integration-shared";
+import { getCodexHome, getTrustedCodexHomes } from "../../codex-integration-shared";
 import type { CodexParsedRequest } from "../../types";
 import {
   extractChatGptTurnEnvironmentClaim,
@@ -160,13 +160,17 @@ function conflictingAuthorityFields(claim: ChatGptEnvironmentClaim, right: ChatG
 export class ChatGptThreadEnvironmentStore {
   private loaded = false;
   private readonly threads = new Map<string, StoredThreadEnvironment>();
+  private readonly codexHomes: readonly string[];
 
   constructor(
     private readonly path?: string,
     private readonly now: () => number = Date.now,
-    private readonly codexHome: string = getCodexHome(),
+    codexHome: string = getCodexHome(),
     private readonly sqliteHome?: string,
-  ) {}
+    additionalCodexHomes?: readonly string[],
+  ) {
+    this.codexHomes = getTrustedCodexHomes(codexHome, additionalCodexHomes);
+  }
 
   resolve(parsed: CodexParsedRequest): ChatGptTurnEnvironment {
     const identity = extractChatGptTurnIdentity(parsed);
@@ -174,11 +178,15 @@ export class ChatGptThreadEnvironmentStore {
     try {
       const claim = extractChatGptTurnEnvironmentClaim(parsed);
       const environment = claim.environment;
-      if (environment.sandboxPolicy.type !== "dangerFullAccess" && !claim.statesNetworkAccess) {
+      if (this.codexHomes.length > 1
+        || (environment.sandboxPolicy.type !== "dangerFullAccess" && !claim.statesNetworkAccess)) {
+        // A shared bridge must prove the current native owner even for complete envelopes.
         // Modern envelopes state filesystem access only. Resolve the current native policy on
         // the first round too: absence of a network statement is not a disabled-network grant.
         initialClaim = claim;
-        throw new MissingTrustedCodexEnvironmentError("network access");
+        throw new MissingTrustedCodexEnvironmentError(
+          this.codexHomes.length > 1 ? "current native task ownership" : "network access",
+        );
       }
       if (identity.threadId) this.set(identity.threadId, environment);
       return environment;
@@ -204,8 +212,9 @@ export class ChatGptThreadEnvironmentStore {
       const compactionSourceTurnId = parsed._compactionRequest
         ? extractChatGptCompactionSourceRevision(parsed).turnId : undefined;
       if (rolloutIdentity && identity.turnId) {
-        const rolloutEnvironment = resolveCurrentCodexRolloutEnvironment({
-          codexHome: this.codexHome,
+        const rollout = resolveCurrentCodexRolloutEnvironment({
+          codexHome: this.codexHomes[0]!,
+          additionalCodexHomes: this.codexHomes.slice(1),
           ...(this.sqliteHome ? { sqliteHome: this.sqliteHome } : {}),
           lineage: rolloutIdentity,
           turnId: identity.turnId,
@@ -213,7 +222,22 @@ export class ChatGptThreadEnvironmentStore {
           ...(historicalMessages ? { historicalEnvironmentMessages: historicalMessages } : {}),
           tools: parsed.context.tools,
         });
-        if (rolloutEnvironment) {
+        if (rollout) {
+          let rolloutEnvironment = rollout.environment;
+          // After a restart Codex can omit workspace_roots while still explicitly
+          // granting unrestricted access. In that case [cwd] is not a native
+          // restriction. Keep the current envelope's workspace context; permissions
+          // and task identity still come from the exact current native record.
+          if (!rollout.workspaceRootsDeclared
+            && rolloutEnvironment.sandboxPolicy.type === "dangerFullAccess"
+            && currentClaim?.environment.sandboxPolicy.type === "dangerFullAccess"
+            && pathIdentity(currentClaim.environment.cwd) === pathIdentity(rolloutEnvironment.cwd)) {
+            rolloutEnvironment = {
+              ...rolloutEnvironment,
+              roots: [...currentClaim.environment.roots],
+              writableRoots: [...currentClaim.environment.roots],
+            };
+          }
           if (calendarDelta) {
             const nativeRoots = new Set(rolloutEnvironment.roots.map(pathIdentity));
             if (rolloutEnvironment.sandboxPolicy.type !== "dangerFullAccess"
@@ -233,6 +257,9 @@ export class ChatGptThreadEnvironmentStore {
           this.set(rolloutIdentity.threadId, rolloutEnvironment);
           return rolloutEnvironment;
         }
+      }
+      if (this.codexHomes.length > 1) {
+        throw new Error("No current native Codex task proof in the trusted homes", { cause: error });
       }
       // Only a current native rollout can supersede an unrecognized historical envelope. Without
       // that proof, do not turn arbitrary history or an invalid update into cached authority.
@@ -285,6 +312,8 @@ export class ChatGptThreadEnvironmentStore {
   }
 
   private set(threadId: string, environment: ChatGptTurnEnvironment): void {
+    // Shared-home recovery uses current native proof, never the single-home cache.
+    if (this.codexHomes.length > 1) return;
     // Only this path has already verified authority from the current request, native
     // rollout, or a successfully loaded parent. A cache read alone may never recover it.
     this.load(true);

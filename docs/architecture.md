@@ -34,7 +34,7 @@ launcher-owned codex-chatgpt-web daemon
   unpinned `chatgpt-web/pro`. They keep old tasks and cached selections working. The existing release
   upgrade reruns integration setup and invalidates the model cache; Codex must restart for the new
   picker. Native models and existing context/compaction budgets are preserved.
-- Sends the complete Codex context and image attachments to a fresh ChatGPT conversation (Temporary Chat by default).
+- Sends the complete Codex context and image attachments to a fresh ChatGPT conversation (saved in ChatGPT history by default).
 - Never starts the broker, tunnel, or MCP server.
 - Emits a nonfatal Codex commentary warning that local tools are unavailable for the selected model.
 
@@ -150,12 +150,14 @@ Top-level `model_context_window` raises only the proxied native rows' advertised
 Codex to apply its own configured context override without clamping. Routed ChatGPT Web models
 retain their measured adapter-owned limits.
 
-**Save chats in ChatGPT** (`setup --saved-chats`; `--temporary-chats` restores the default)
+**Save chats in ChatGPT** (`setup --saved-chats`, enabled by default; `--temporary-chats` opts out)
 uses ordinary saved conversations for task turns in Automatic and Zero Risk modes. This is
 independent of conversation reuse. Changing it releases idle retained tabs, and its provider
 configuration participates in conversation identity. Saved history does not authorize reopening
 an arbitrary ChatGPT conversation. Compaction still starts the next context epoch in a new chat;
-account inspection continues to use an empty Temporary Chat. ChatGPT memory and custom instructions
+connector verification uses the same saved/temporary mode as task turns, while account inspection
+continues to use an empty Temporary Chat. Existing explicit choices are preserved on upgrade.
+ChatGPT memory and custom instructions
 may apply to saved conversations.
 
 Automatic mode also offers an explicit **New browser chat for each turn** setting, disabled by
@@ -277,6 +279,15 @@ unexpected child exit is recovered with a bounded restart budget; a crash loop b
 launcher error.
 
 ## Security invariants
+
+Native task recovery normally uses the bridge's own `CODEX_HOME`. An operator can register up to
+seven additional local homes through `CODEX_CHATGPT_WEB_TRUSTED_CODEX_HOMES`, a JSON array of absolute
+existing directories. Request data cannot register homes. Directory aliases are canonicalized;
+the resolver establishes one owning home before reading the current turn's permissions and rejects
+duplicate thread ownership. Each secondary home uses its own `sqlite_home` configuration, without
+inheriting the primary process's SQLite override. With multiple homes, every turn needs current
+native proof and the legacy single-home environment cache is neither read nor written. DEV profile
+activation removes the production registration. See [setup details](../TROUBLESHOOTING.md#a-second-codex_home-fails-with-missing-network-access-in-trusted-codex-environment-context).
 
 - Bind the Responses proxy and health endpoint to loopback only.
 - Store browser state and tunnel credentials under the application home with mode `0600`.
