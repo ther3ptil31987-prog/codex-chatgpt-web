@@ -204,7 +204,10 @@ export class ChatGptThreadEnvironmentStore {
         ? extractChatGptSteeringEnvironmentClaim(parsed) : undefined;
       const calendarDelta = hasCurrentContext && !currentCompaction
         ? extractChatGptCalendarEnvironmentDelta(parsed) : undefined;
-      if (hasCurrentContext && !currentCompaction && !initialClaim && !historicalMessages && !steeringClaim && !calendarDelta) throw error;
+      if (hasCurrentContext && !currentCompaction && !initialClaim && !historicalMessages && !steeringClaim && !calendarDelta) {
+        console.warn("[chatgpt-web] trusted_environment_recovery rejected=unrecognized_current_context");
+        throw error;
+      }
       const currentClaim = initialClaim ?? (currentCompaction ? extractChatGptContinuationEnvironmentClaim(parsed) : steeringClaim);
       const rolloutIdentity = lineage ?? extractChatGptRootThreadMetadata(parsed);
       // Automatic compaction has a current turn_context; standalone compaction has only its
@@ -258,6 +261,14 @@ export class ChatGptThreadEnvironmentStore {
           return rolloutEnvironment;
         }
       }
+      console.warn(`[chatgpt-web] trusted_environment_recovery ${JSON.stringify({
+        currentContext: hasCurrentContext,
+        compactionContinuation: currentCompaction,
+        nativeMetadata: rolloutIdentity !== undefined,
+        nativeTurnId: identity.turnId !== undefined,
+        registeredHomes: this.codexHomes.length,
+        nativeRolloutFound: false,
+      })}`);
       if (this.codexHomes.length > 1) {
         throw new Error("No current native Codex task proof in the trusted homes", { cause: error });
       }

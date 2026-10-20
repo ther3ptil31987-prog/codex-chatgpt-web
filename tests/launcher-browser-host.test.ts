@@ -9,6 +9,7 @@ import {
   LauncherManualTurnTimedOutError,
   LauncherRetainedConversationUnavailableError,
   LauncherBrowserTurnCancelledError,
+  LauncherBrowserTurnOwnerLostError,
   endLauncherManualTurn,
   inspectLauncherBrowserHost,
   inspectLauncherBrowserHostLiveness,
@@ -330,6 +331,34 @@ test("launcher turn control preserves a missing retained conversation as a typed
     }).catch(caught => caught);
     expect(error).toBeInstanceOf(LauncherRetainedConversationUnavailableError);
     expect(error.message).toContain("retained source missing");
+  } finally {
+    await new Promise<void>(resolve => server.close(() => resolve()));
+  }
+});
+
+test("launcher turn control preserves a lost running helper as a typed signal", async () => {
+  const server = createServer(async (request, response) => {
+    for await (const _chunk of request) { /* drain request */ }
+    response.writeHead(409, { "content-type": "application/json" });
+    response.end('{"error":"running helper exited","code":"turn_owner_lost"}\n');
+  });
+  await new Promise<void>((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", resolve);
+  });
+  try {
+    const address = server.address();
+    if (!address || typeof address === "string") throw new Error("test server has no port");
+    const path = descriptorFile(`http://127.0.0.1:${address.port}`);
+    const error = await notifyLauncherTurn(path, {
+      phase: "start",
+      traceId: "missing123456",
+      helperPid: process.pid,
+      conversationKey: "a".repeat(64),
+      requireRetainedConversation: true,
+    }).catch(caught => caught);
+    expect(error).toBeInstanceOf(LauncherBrowserTurnOwnerLostError);
+    expect(error.message).toContain("running helper exited");
   } finally {
     await new Promise<void>(resolve => server.close(() => resolve()));
   }
