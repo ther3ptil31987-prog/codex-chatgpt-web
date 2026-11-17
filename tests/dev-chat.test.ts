@@ -78,6 +78,35 @@ test("remote outer harness owns a turn through the live broker protocol", async 
   }
 });
 
+test("remote owners preserve Full Access worktree cwd outside project roots", async () => {
+  const root = scratch("cgw-dev-worktree");
+  const socketPath = defaultBrokerEndpoint(root);
+  const broker = TurnBroker.forSocket(socketPath);
+  const remote = new RemoteTurnBroker(socketPath);
+  await broker.listen();
+  const environment = {
+    cwd: join(root, "worktree"), roots: [join(root, "project")],
+    writableRoots: [join(root, "project")],
+    sandboxPolicy: { type: "dangerFullAccess" as const }, tools: [],
+  };
+  try {
+    const token = await remote.register(environment, 60_000, "worktree-owner");
+    const claimed = await callTurnBroker<{ bindingId: string }>(socketPath, { method: "claim", token });
+    const resolved = await callTurnBroker(socketPath, { method: "resolve", bindingId: claimed.bindingId });
+    expect(resolved).toMatchObject({ environment });
+    await remote.revoke(token);
+    for (const sandboxPolicy of [
+      { type: "readOnly" as const, networkAccess: false },
+      { type: "workspaceWrite" as const, writableRoots: environment.roots, networkAccess: false },
+    ]) {
+      await expect(remote.register({ ...environment, sandboxPolicy }, 60_000, "restricted-worktree"))
+        .rejects.toThrow("environment is invalid");
+    }
+  } finally {
+    await broker.close();
+  }
+});
+
 test("disconnecting a remote owner_next removes its broker waiter", async () => {
   const root = scratch("cgw-dev-owner-waiter");
   const socketPath = defaultBrokerEndpoint(root);

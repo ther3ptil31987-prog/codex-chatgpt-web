@@ -47,12 +47,11 @@ async function stopChild(child) {
   }
 }
 
-async function runBrowserHelperOperation({ helper, descriptorPath, appName, useSavedChats = false, operation, payload = {}, logger }) {
+async function runBrowserHelperOperation({ helper, descriptorPath, appName, operation, useTemporaryChats = true, payload = {}, logger }) {
   if (!helper || typeof helper.executable !== "string" || typeof helper.script !== "string") {
     throw new Error("Browser helper verification command is invalid");
   }
-  if (typeof descriptorPath !== "string" || !descriptorPath || typeof appName !== "string" || !appName
-    || typeof useSavedChats !== "boolean") {
+  if (typeof descriptorPath !== "string" || !descriptorPath || typeof appName !== "string" || !appName) {
     throw new Error("Browser helper verification config is invalid");
   }
   if (!["verify", "inspect", "smoke", "limits"].includes(operation)) {
@@ -112,7 +111,7 @@ async function runBrowserHelperOperation({ helper, descriptorPath, appName, useS
           ...payload,
           type: operation,
           id,
-          config: { appName, browserHostDescriptorPath: descriptorPath, useSavedChats },
+          config: { appName, browserHostDescriptorPath: descriptorPath, useTemporaryChats },
         }).catch(error => finish(error instanceof Error ? error : new Error(String(error))));
         return;
       }

@@ -1,9 +1,43 @@
-// Reproduction contributed by @alexalok in PR #730.
+// Reproduction contributed by @alexalok in PR #730; explicit picker by @nofihq in #921.
+import { readFileSync } from "node:fs";
 import { expect, test } from "bun:test";
 import { chromium } from "playwright-core";
 import { ChatGptBrowserWorker } from "../src/adapters/chatgpt-web/browser-worker";
 import { CHATGPT_WEB_MODEL_ID } from "../src/adapters/chatgpt-web/model";
 import { readChatGptUsageModel } from "../src/adapters/chatgpt-web/limits";
+
+// October 28 picker: Default mixes model families; explicit Sol has five
+// positions and explicit Astra has six. Never infer a family from Default.
+const EXPLICIT_PICKER = readFileSync(new URL("./fixtures/chatgpt-model-picker-explicit-2026-10-28.html", import.meta.url), "utf8");
+
+for (const [effort, label, usageModel] of [["high", "6 Sol High", "other"], ["xhigh", "6 Sol Extra High", "other"], ["max", "6 Astra Max", "gpt-6-pro"]] as const) {
+  test.skipIf(!process.env.CHATGPT_DOM_TEST_BROWSER)(`explicit picker selects exact GPT-6 ${effort} beside GPT-6.1`, async () => {
+    const browser=await chromium.launch({executablePath:process.env.CHATGPT_DOM_TEST_BROWSER,headless:true});
+    try {
+      const page=await browser.newPage();await page.setContent(EXPLICIT_PICKER);
+      const worker=Object.create(ChatGptBrowserWorker.prototype) as any;
+      const mode=await worker.selectModelAndEffort(page,CHATGPT_WEB_MODEL_ID,effort,{localToolsEnabled:false,solAvailable:true,extraHighAvailable:true,proAvailable:true},undefined,true,"6");
+      expect(mode.selection.label).toBe(label);expect(mode.usageModel).toBe(usageModel);
+      expect(await page.locator('#prompt-textarea').innerText()).toBe('Draft');
+    } finally {await browser.close();}
+  },30_000);
+}
+
+test.skipIf(!process.env.CHATGPT_DOM_TEST_BROWSER)("explicit picker refuses absent GPT-6 Sol and conflicting GPT-6.1 evidence",async()=>{
+  const browser=await chromium.launch({executablePath:process.env.CHATGPT_DOM_TEST_BROWSER,headless:true});
+  try {
+    for(const scenario of ['omitSol','conflictingHeader']){
+      const page=await browser.newPage();await page.setContent('<script>window.'+scenario+'=true;</script>'+EXPLICIT_PICKER);
+      const worker=Object.create(ChatGptBrowserWorker.prototype) as any;
+      let failure: unknown;
+      try {
+        await worker.selectModelAndEffort(page,CHATGPT_WEB_MODEL_ID,'high',{localToolsEnabled:false,solAvailable:true,extraHighAvailable:true,proAvailable:true},undefined,false,'6');
+      } catch (error) { failure=error; }
+      expect(String(failure)).toContain('could not be selected and verified');
+      expect(await page.locator('#prompt-textarea').innerText()).toBe('Draft');await page.close();
+    }
+  }finally{await browser.close();}
+},30_000);
 
 // Mirrors ChatGPT's power picker as captured live on 2026-09-29 (English, Pro account): the slider
 // announcement reads only "Pro, 5 of 5." and the model version appears in the "Select model"
@@ -16,64 +50,14 @@ type Picker = {
 };
 
 const PICKERS = {
-  current: { header: (value: number) => value === 4 ? "6" : "5.6", status: (effort: string, value: number) => effort + ", " + (value + 1) + " of 5." },
-  legacy: { header: null, status: (effort: string, value: number) => (value === 4 ? "6 " : "5.6 ") + effort + ", " + (value + 1) + " of 5." },
+  splitHeader: { header: (value: number) => value === 4 ? "6" : "5.6", status: (effort: string, value: number) => effort + ", " + (value + 1) + " of 5." },
+  versionedAnnouncement: { header: null, status: (effort: string, value: number) => (value === 4 ? "6 " : "5.6 ") + effort + ", " + (value + 1) + " of 5." },
   future: { header: (value: number) => value === 4 ? "7" : "5.6", status: (effort: string, value: number) => effort + ", " + (value + 1) + " of 5." },
   versionless: { header: () => "", status: (effort: string, value: number) => effort + ", " + (value + 1) + " of 5." },
   conflicting: { header: (value: number) => value === 4 ? "6" : "5.6", status: (effort: string, value: number) => (value === 4 ? "5.6 " : "") + effort + ", " + (value + 1) + " of 5." },
 } satisfies Record<string, Picker>;
 
-const FIXTURE = `<form><div id="prompt-textarea" contenteditable="true">Draft</div>
-  <button type="button" data-tone="neutral" aria-haspopup="menu" aria-controls="picker" aria-expanded="false">Medium</button></form>
-  <div id="picker" role="menu" aria-label="Select ChatGPT model" hidden>
-    <div data-model-picker-view="simple">
-      <div aria-hidden="false" data-active="true">
-        <div data-explicit-model="false">
-          <div role="menuitem" aria-hidden="false" aria-label="Select model" data-model-picker-view-toggle="true" tabindex="0">
-            <div data-menu-row-content="true"><span><span><span id="header-version"></span><span id="header-effort" data-accent="true"></span><svg></svg></span></span></div>
-          </div>
-          <span aria-hidden="true"><span>Consumes usage limits faster</span></span>
-        </div>
-        <span aria-live="polite" id="status" role="status"></span>
-        <span id="hint">Use Left and Right arrow keys to adjust power</span>
-        <div role="menuitem" aria-describedby="status hint" aria-label="Power" data-reasoning-slider="true" tabindex="-1">
-          <div data-menu-row-content="true"><span><div data-model-picker-power-slider style="height:30px;width:250px"></div></span></div>
-        </div>
-      </div>
-      <div aria-hidden="true" data-active="false" inert>
-        <span>Locked, opens access options</span>
-        <div role="menuitemradio" aria-checked="true" data-model-selected="true" tabindex="-1"><div data-menu-row-content="true"><span>Latest</span></div></div>
-        <div role="menuitemradio" aria-checked="false" tabindex="-1"><div data-menu-row-content="true"><span>GPT-5.6 Sol</span></div></div>
-        <div role="menuitemradio" aria-checked="false" tabindex="-1"><div data-menu-row-content="true"><div><span>GPT-5.5</span><span>Leaving on October 14</span></div></div></div>
-      </div>
-    </div>
-  </div>
-  <script>
-    const efforts = ["Instant", "Medium", "High", "Extra High", "Pro"];
-    const control = document.querySelector("button"), menu = document.querySelector("#picker");
-    let value = 1;
-    function render() {
-      document.querySelector("[data-model-picker-power-slider]").innerHTML = '<span data-orientation="horizontal" aria-disabled="false">'
-        + efforts.map((_, i) => '<span data-selected="' + (i <= value) + '"></span>').join("")
-        + '<span role="slider" aria-hidden="true" aria-valuemin="0" aria-valuemax="4" aria-valuenow="' + value + '"></span></span>';
-      document.querySelector("#status").textContent = window.pickerStatus(efforts[value], value);
-      if (window.pickerHeader === null) document.querySelector("[data-model-picker-view-toggle]")?.remove();
-      else {
-        document.querySelector("#header-version").textContent = window.pickerHeader(value);
-        document.querySelector("#header-effort").textContent = efforts[value];
-      }
-    }
-    control.onclick = () => {
-      menu.hidden = false; control.setAttribute("aria-expanded", "true"); control.textContent = "Thinking effort"; render();
-    };
-    document.addEventListener("keydown", event => {
-      if (event.key === "Escape") {
-        menu.hidden = true; control.setAttribute("aria-expanded", "false"); control.textContent = efforts[value];
-      } else if (event.key === "ArrowRight" || event.key === "ArrowLeft") {
-        value = Math.max(0, Math.min(4, value + (event.key === "ArrowRight" ? 1 : -1))); render(); event.preventDefault();
-      }
-    });
-  </script>`;
+const FIXTURE = readFileSync(new URL("./fixtures/chatgpt-model-picker-power-2026-09-29.html", import.meta.url), "utf8");
 
 async function selectGpt6Pro(picker: Picker) {
   const browser = await chromium.launch({ executablePath: process.env.CHATGPT_DOM_TEST_BROWSER, headless: true });
@@ -99,12 +83,12 @@ async function selectGpt6Pro(picker: Picker) {
   }
 }
 
-test.skipIf(!process.env.CHATGPT_DOM_TEST_BROWSER)("GPT-6 Pro is verified from the current picker header when the slider announces only the effort", async () => {
-  expect(await selectGpt6Pro(PICKERS.current)).toEqual({ ok: true, label: "Pro", usageModel: "gpt-6-pro", draft: "Draft" });
+test.skipIf(!process.env.CHATGPT_DOM_TEST_BROWSER)("GPT-6 Pro is verified from the September 29 split picker header when the slider announces only the effort", async () => {
+  expect(await selectGpt6Pro(PICKERS.splitHeader)).toEqual({ ok: true, label: "Pro", usageModel: "gpt-6-pro", draft: "Draft" });
 }, 60_000);
 
-test.skipIf(!process.env.CHATGPT_DOM_TEST_BROWSER)("GPT-6 Pro is still verified from the older versioned slider announcement", async () => {
-  expect(await selectGpt6Pro(PICKERS.legacy)).toEqual({ ok: true, label: "Pro", usageModel: "gpt-6-pro", draft: "Draft" });
+test.skipIf(!process.env.CHATGPT_DOM_TEST_BROWSER)("GPT-6 Pro is still verified from the versioned slider announcement", async () => {
+  expect(await selectGpt6Pro(PICKERS.versionedAnnouncement)).toEqual({ ok: true, label: "Pro", usageModel: "gpt-6-pro", draft: "Draft" });
 }, 60_000);
 
 for (const scenario of ["future", "versionless", "conflicting"] as const)

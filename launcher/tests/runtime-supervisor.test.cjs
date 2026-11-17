@@ -674,7 +674,9 @@ test("ready inventory cannot replace missing MCP evidence, and local evidence re
   }
 });
 
-test("tunnel readiness accepts the official tmux status without inventing a PID", async () => {
+test("tunnel readiness accepts the official tmux status without inventing a PID", { timeout: 5000 }, async t => {
+  // This checks an already-ready status, so runner scheduling must not consume the polling budget.
+  t.mock.timers.enable({ apis: ["Date"], now: 1_000_000 });
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-web-gpt-tunnel-health-tmux-"));
   const supervisor = new RuntimeSupervisor({
     app: { getVersion: () => "0.2.0", isPackaged: false },
@@ -1372,6 +1374,95 @@ test("launcher supervisor refuses shutdown while a Codex turn is active and comp
   assert.deepEqual(actions, ["drain", "resume"]);
 });
 
+for (const failure of ["active-turn", "unverified-pid", "shutdown-error"]) {
+  test(`ownership write failure preserves the runtime when cleanup is unsafe: ${failure}`, async () => {
+    const operations = [];
+    const supervisor = new RuntimeSupervisor({
+      app: { getVersion: () => "0.2.0", isPackaged: false },
+      logger: { info() {}, warn() {}, error() {} },
+      sourceRoot: os.tmpdir(), coreHome: os.tmpdir(),
+      browserDescriptorPath: path.join(os.tmpdir(), "launcher.json"),
+      publishOperation: value => operations.push(value),
+    });
+    const daemon = supervisor.daemon = { pid: 123_456_783, exitCode: null, signalCode: null };
+    const tunnel = supervisor.tunnel = { pid: 123_456_784, managed: true };
+    supervisor.readConfig = () => ({ mode: "full" });
+    supervisor.writeState = () => { throw new Error("disk full"); };
+    supervisor.proxyHealth = async (_config, _timeout, pid) => {
+      assert.equal(pid, daemon.pid);
+      return failure !== "unverified-pid";
+    };
+    const actions = [];
+    supervisor.control = async (_config, action) => {
+      actions.push(action);
+      return { status: "ok", accepting_turns: action === "resume",
+        active_http_turns: failure === "active-turn" ? 1 : 0, active_browser_turns: 0 };
+    };
+    const drain = supervisor.acquireDrain.bind(supervisor);
+    supervisor.acquireDrain = config => drain(config, 0);
+    supervisor.shutdownDaemon = async () => { throw new Error("shutdown unavailable"); };
+    supervisor.stopChild = async () => { assert.fail("must not force-kill an unverified or active daemon"); };
+    supervisor.stopTunnelGracefully = async () => { assert.fail("must preserve the tunnel if the daemon cannot stop"); };
+    assert.equal(supervisor.tryWriteState("degraded"), false);
+    await supervisor.stateWriteCleanup;
+    assert.equal(supervisor.daemon, daemon);
+    assert.equal(supervisor.tunnel, tunnel);
+    assert.equal(supervisor.stopping, true);
+    assert.deepEqual(actions, failure === "unverified-pid" ? [] : ["drain", "resume"]);
+    assert.match(operations.at(-1).message, /owned runtime cleanup failed/);
+    await assert.rejects(supervisor.startIfConfigured(), /owned runtime cleanup failed/);
+  });
+}
+
+test("ownership cleanup waits for in-flight recovery and prevents overlapping starts", async () => {
+  const supervisor = new RuntimeSupervisor({
+    app: { getVersion: () => "0.2.0", isPackaged: false },
+    logger: { info() {}, warn() {}, error() {} },
+    sourceRoot: os.tmpdir(), coreHome: os.tmpdir(),
+    browserDescriptorPath: path.join(os.tmpdir(), "launcher.json"),
+  });
+  const pending = () => {
+    let resolve;
+    const promise = new Promise(done => { resolve = done; });
+    return { promise, resolve };
+  };
+  const recovery = pending();
+  const cleanup = pending();
+  const stopping = pending();
+  supervisor.recoveryTasks.add(recovery.promise);
+  supervisor.tunnel = { pid: 123_456_783, managed: true };
+  supervisor.readConfig = () => ({ mode: "full" });
+  supervisor.writeState = () => { throw new Error("disk full"); };
+  let stops = 0;
+  supervisor.stopTunnelGracefully = async () => {
+    stops += 1;
+    stopping.resolve();
+    await cleanup.promise;
+    supervisor.tunnel = null;
+    supervisor.tryWriteState("stopping");
+  };
+  let starts = 0;
+  supervisor.startConfigured = async () => { starts += 1; return { status: "ready" }; };
+  assert.equal(supervisor.tryWriteState("degraded"), false);
+  const failedStart = assert.rejects(supervisor.startIfConfigured(), /disk full/);
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(stops, 0);
+  recovery.resolve();
+  await stopping.promise;
+  assert.equal(starts, 0);
+  assert.equal(supervisor.tryWriteState("degraded"), false);
+  const cleanupTask = supervisor.stateWriteCleanup;
+  cleanup.resolve();
+  await cleanupTask;
+  await failedStart;
+  assert.equal(stops, 1);
+  assert.equal(starts, 0);
+  supervisor.writeState = () => {};
+  assert.deepEqual(await supervisor.startIfConfigured(), { status: "ready" });
+  assert.equal(starts, 1);
+  assert.equal(supervisor.stateWriteFailure, null);
+});
+
 test("launcher supervisor waits for an in-flight HTTP turn to finish after draining", async () => {
   const actions = [];
   const supervisor = new RuntimeSupervisor({
@@ -1938,6 +2029,26 @@ process.once("SIGTERM", () => server.close(() => process.exit(0)));
     assert.equal(stopped.status, "stopped");
     assert.equal(fs.existsSync(path.join(root, "runtime", "launcher-supervisor.json")), false);
     assert.equal(records.some((record) => record.event === "runtime.daemon_started"), true);
+
+    // A real filesystem write error must stop the idle child, and block new
+    // starts until ownership can be persisted again.
+    await supervisor.startIfConfigured();
+    const child = supervisor.daemon;
+    const statePath = supervisor.statePath;
+    const blocker = path.join(root, "not-a-directory");
+    fs.writeFileSync(blocker, "blocked");
+    supervisor.statePath = path.join(blocker, "state.json");
+    try {
+      assert.equal(supervisor.tryWriteState("ready"), false);
+      await supervisor.stateWriteCleanup;
+      assert.equal(supervisor.daemon, null);
+      assert.notEqual(child.exitCode, null);
+      assert.equal(supervisor.stopping, true);
+      await assert.rejects(supervisor.startIfConfigured(), /ENOTDIR|EEXIST/);
+    } finally {
+      supervisor.statePath = statePath;
+    }
+    assert.equal((await supervisor.startIfConfigured()).status, "ready");
   } finally {
     await supervisor.stopForSetup().catch(() => {});
     fs.rmSync(root, { recursive: true, force: true });

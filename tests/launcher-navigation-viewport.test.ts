@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { _electron } from "playwright-core";
 import { ChatGptBrowserWorker } from "../src/adapters/chatgpt-web/browser-worker";
-import { activateChatGptEffortMenu } from "../src/chatgpt-session";
+import { activateChatGptEffortMenu } from "../src/chatgpt-ui/model-picker";
 
 test.skipIf(!process.env.LAUNCHER_TEST_ELECTRON)("navigated Electron task pages stay usable before delayed resources finish", async () => {
   const userData = mkdtempSync(join(tmpdir(), "launcher-navigation-"));

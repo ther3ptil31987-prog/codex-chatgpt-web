@@ -34,7 +34,7 @@ launcher-owned codex-chatgpt-web daemon
   unpinned `chatgpt-web/pro`. They keep old tasks and cached selections working. The existing release
   upgrade reruns integration setup and invalidates the model cache; Codex must restart for the new
   picker. Native models and existing context/compaction budgets are preserved.
-- Sends the complete Codex context and image attachments to a fresh ChatGPT conversation (saved in ChatGPT history by default).
+- Sends the complete Codex context and image attachments to a fresh ChatGPT conversation (Temporary Chat by default).
 - Never starts the broker, tunnel, or MCP server.
 - Emits a nonfatal Codex commentary warning that local tools are unavailable for the selected model.
 
@@ -97,6 +97,12 @@ label does not itself replace a remote connector's cached schema; legacy connect
 
 ## Browser lifecycle
 
+ChatGPT DOM contracts live in [`src/chatgpt-ui`](../src/chatgpt-ui/README.md), grouped
+by composer, model picker and turn renderer. Each component records its historical
+evidence and regression coverage. Model policy and turn ownership remain outside
+that layer. Diagnostic checkpoints identify observed structural variants without
+copying message content; a variant's age never selects or retires it automatically.
+
 The desktop launcher owns one persistent Electron partition and up to five task-bound browser
 tabs. Each task/model/effort/compaction epoch owns one exact `WebContentsView` lease; sequential
 native messages reuse that surface, while each message receives a fresh turn-bound MCP token and
@@ -117,7 +123,7 @@ logical identities fail explicitly; accepted messages are never resent to repair
 Sign-in uses that same persistent Electron partition. ChatGPT login pages and allowed identity-
 provider popups are adopted into a temporary `WebContentsView` inside the launcher instead of being
 redirected to another browser. After the provider returns to ChatGPT, the launcher requires both a
-server-authenticated session and the Temporary Chat composer in the primary owned view, then closes
+server-authenticated session and a new ordinary chat composer in the primary owned view, then closes
 the temporary auth view. There is no browser-profile handoff, cookie import, CDP login port, or
 temporary session-transfer directory.
 
@@ -150,15 +156,16 @@ Top-level `model_context_window` raises only the proxied native rows' advertised
 Codex to apply its own configured context override without clamping. Routed ChatGPT Web models
 retain their measured adapter-owned limits.
 
-**Save chats in ChatGPT** (`setup --saved-chats`, enabled by default; `--temporary-chats` opts out)
-uses ordinary saved conversations for task turns in Automatic and Zero Risk modes. This is
-independent of conversation reuse. Changing it releases idle retained tabs, and its provider
-configuration participates in conversation identity. Saved history does not authorize reopening
-an arbitrary ChatGPT conversation. Compaction still starts the next context epoch in a new chat;
-connector verification uses the same saved/temporary mode as task turns, while account inspection
-continues to use an empty Temporary Chat. Existing explicit choices are preserved on upgrade.
-ChatGPT memory and custom instructions
-may apply to saved conversations.
+Automatic and Zero Risk task turns use Temporary Chat by default. The `useTemporaryChats`
+preference (`setup --temporary-chats`; `--ordinary-chats` to disable) selects the mode for task
+turns, connector verification and smoke tests. Sign-in and account
+inspection still use ordinary chats. The old `useSavedChats` preference is discarded and cannot
+override the new setting. An absent new setting defaults to true; an explicit false is preserved.
+Changing modes retires idle retained task surfaces after setup succeeds;
+the launcher refuses to change it during active browser work. This is independent of conversation
+reuse. Saved history does not authorize reopening an arbitrary ChatGPT conversation. Compaction
+still starts the next context epoch in a new chat. ChatGPT memory and custom instructions may apply
+in either mode.
 
 Automatic mode also offers an explicit **New browser chat for each turn** setting, disabled by
 default (`setup --fresh-conversation`; `--retained-conversation` restores reuse). Each native turn

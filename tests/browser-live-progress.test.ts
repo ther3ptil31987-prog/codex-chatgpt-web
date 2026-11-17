@@ -4,7 +4,7 @@ import { chromium } from "playwright-core";
 import { chatGptResponseStructureLogEntries, chatGptResponseStructures } from "../src/adapters/chatgpt-web/browser-response-structure";
 import { chatGptInteractionState } from "../src/adapters/chatgpt-web/browser-interaction-state";
 import { ChatGptBrowserObservationTimeoutError, ChatGptBrowserWorker, ChatGptCompletionTracker, ChatGptSubmissionRejectionObserver, ChatGptTurnDomHealthTracker, throwIfChatGptTerminalErrorAlert } from "../src/adapters/chatgpt-web/browser-worker";
-import { chatGptAssistantTurnSelector, chatGptTurnContainerSelector } from "../src/chatgpt-session";
+import { chatGptAssistantTurnSelector, chatGptTurnContainerSelector } from "../src/chatgpt-ui/turns";
 import { ChatGptExternalTurnProgress } from "../src/adapters/chatgpt-web/turn-progress";
 
 test("the largest response diagnostics survive the launcher's safe-log string limit intact", () => {
@@ -167,6 +167,37 @@ test.each(["requestfinished", "requestfailed"])("owned SSE keeps a quiet respons
   expect(await observer.failure()).toBeUndefined();
   observer.dispose();
   expect(page.listenerCount("response")).toBe(0);
+});
+
+test("a late final after Stop disappears survives the observed #885 timeline", () => {
+  const health = new ChatGptTurnDomHealthTracker();
+  const completion = new ChatGptCompletionTracker();
+  const quiet = { responsePresent: true, running: false, currentText: "", completionActionVisible: false };
+  // The reporter's response finished about 65 seconds after the former 60-second
+  // watchdog expired. Neither the absence of Stop nor a quiet stream proves completion.
+  for (const now of [0, 60_000, 124_999]) {
+    expect(health.update(quiet, now)).toBeUndefined();
+    expect(completion.update(quiet, now)).toBeFalse();
+  }
+  const final = { ...quiet, currentText: "The requested work is complete.", completionActionVisible: true };
+  expect(health.update(final, 125_000)).toBeUndefined();
+  expect(completion.update(final, 125_000)).toBeFalse();
+  expect(completion.update(final, 127_000)).toBeTrue();
+});
+
+test("quiet response waiting remains bounded without delaying proven empty completion or lost DOM", () => {
+  const quiet = { responsePresent: true, running: false, currentText: "", completionActionVisible: false };
+  const stalled = new ChatGptTurnDomHealthTracker();
+  expect(stalled.update(quiet, 0)).toBeUndefined();
+  expect(stalled.update(quiet, 599_999)).toBeUndefined();
+  expect(stalled.update(quiet, 600_000)).toContain("without a final answer");
+  const completedEmpty = new ChatGptTurnDomHealthTracker();
+  expect(completedEmpty.update({ ...quiet, completionActionVisible: true }, 0)).toBeUndefined();
+  expect(completedEmpty.update({ ...quiet, completionActionVisible: true }, 10_000))
+    .toContain("completed without a final answer");
+  const vanished = new ChatGptTurnDomHealthTracker();
+  expect(vanished.update({ ...quiet, responsePresent: false }, 0)).toBeUndefined();
+  expect(vanished.update({ ...quiet, responsePresent: false }, 60_000)).toContain("did not create a response DOM");
 });
 
 test.each(["accepted", "late-accepted", "cancelled", "press-failed"])("a blocked Enter command is handled once: %s", async outcome => {

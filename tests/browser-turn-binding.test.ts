@@ -4,6 +4,43 @@ import { ChatGptBrowserWorker } from "../src/adapters/chatgpt-web/browser-worker
 import { chatGptHtmlToMarkdown, ChatGptMarkdownBuffer } from "../src/adapters/chatgpt-web/markdown";
 import { readFileSync } from "node:fs";
 
+// 2026-11-08, #948: scrolling a real retained ChatGPT conversation removed whole
+// data-turn-key groups. Returning to them reported three new user turns without Send.
+test.skipIf(!process.env.CHATGPT_DOM_TEST_BROWSER)("scrolling previously observed history cannot acknowledge Send after helper replacement", async () => {
+  const browser = await chromium.launch({ executablePath: process.env.CHATGPT_DOM_TEST_BROWSER, headless: true });
+  try {
+    const page = await browser.newPage();
+    const group = (id: string) => `<div data-turn-key="${id}"><div data-user-message-bubble>${id}</div><div data-conversation-role="assistant">Answer</div></div>`;
+    const old = ["old-top", "old-middle", "old-bottom"].map(group).join("");
+    await page.setContent(`<main>${old}</main>`);
+    const first = Object.create(ChatGptBrowserWorker.prototype) as any;
+    await first.submissionDomState(page);
+    // The old groups were observed by a previous helper, then scrolled out of the DOM.
+    await page.locator("main").evaluate(node => { node.replaceChildren(); });
+    const second = Object.create(ChatGptBrowserWorker.prototype) as any;
+    const baseline = await second.captureSubmissionBaseline(page, "Next request");
+    await page.locator("main").evaluate((node, html) => { node.innerHTML = html; }, old);
+    expect(await second.currentSubmissionEvidence(page, baseline)).toBeUndefined();
+    // The same unchanged observation must also work through the DOM cache.
+    expect(await second.currentSubmissionEvidence(page, baseline)).toBeUndefined();
+
+    await page.locator("main").evaluate((node, html) => node.insertAdjacentHTML("beforeend", html), group("new-request"));
+    expect(await second.currentSubmissionEvidence(page, baseline)).toBe("user_turn");
+    expect(baseline.acceptedUserIdentity).toBe("group:user:new-request");
+    const binding = await second.waitForNewAssistantTurn(page, baseline, Date.now() + 2000);
+    expect(binding.identity).toBe("group:assistant:new-request");
+    // Observing a competing post-baseline turn must never add it to that baseline.
+    await page.locator("main").evaluate((node, html) => node.insertAdjacentHTML("beforeend", html), group("competing-request"));
+    await expect(second.currentSubmissionEvidence(page, baseline)).rejects.toThrow("2 new conversation turns");
+
+    await page.goto("about:blank");
+    await page.setContent("<main></main>");
+    const fresh = await second.captureSubmissionBaseline(page, "Next request");
+    await page.locator("main").evaluate((node, html) => { node.innerHTML = html; }, old);
+    await expect(second.currentSubmissionEvidence(page, fresh)).rejects.toThrow("3 new conversation turns");
+  } finally { await browser.close(); }
+}, 15_000);
+
 test.skipIf(!process.env.CHATGPT_DOM_TEST_BROWSER)("CodeMirror language invalidates the response cache and incomplete code is not delivered", async () => {
   const browser = await chromium.launch({ executablePath: process.env.CHATGPT_DOM_TEST_BROWSER, headless: true });
   try {
@@ -315,6 +352,46 @@ test.skipIf(!process.env.CHATGPT_DOM_TEST_BROWSER)("rich-text rebind requires th
       const invalid = await worker.captureSubmissionBaseline(page, "No broker token here", [], token)
         .then(() => undefined, (error: Error) => error);
       expect(invalid).toBeInstanceOf(Error);
+      await page.close();
+    }
+  } finally { await browser.close(); }
+}, 20_000);
+
+test.skipIf(!process.env.CHATGPT_DOM_TEST_BROWSER)("rebind reads token boundaries across rendered lines without accepting hidden or ambiguous tokens", async () => {
+  const browser = await chromium.launch({ executablePath: process.env.CHATGPT_DOM_TEST_BROWSER, headless: true });
+  try {
+    const worker = Object.create(ChatGptBrowserWorker.prototype) as any;
+    const token = "turn_0123456789abcdef0123456789abcdef";
+    const foreign = "turn_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    for (const [name, html, accepted] of [
+      ["line-after", `${token}<br>Continue`, true],
+      ["line-before", `Identity<br>${token}`, true],
+      ["paragraphs", `<p>Identity</p><p>${token}</p><p>Continue</p>`, true],
+      ["inline-format", `<b>${token.slice(0, 10)}</b>${token.slice(10)}`, true],
+      ["inline-suffix", `${token}<span>extra</span>`, false],
+      ["inline-prefix", `<span>extra</span>${token}`, false],
+      ["foreign", foreign, false],
+      ["two-visible", `${token}<br>${foreign}`, false],
+      ["duplicate", `${token}<br>${token}`, false],
+      ["hidden-duplicate", `${token}<span hidden>${token}</span>`, false],
+      ["hidden-foreign", `${token}<span hidden>${foreign}<br>Continue</span>`, false],
+      ["hidden-only", `<span hidden>${token}</span>`, false],
+      ["transparent-only", `<span style="opacity:0">${token}</span>`, false],
+      ["partly-hidden", `${token.slice(0, 10)}<span style="opacity:0">${token.slice(10)}</span>`, false],
+    ] as const) {
+      const page = await browser.newPage();
+      await page.setContent("<main></main>");
+      const baseline = await worker.captureSubmissionBaseline(page, `Identity\n${token}\nContinue`, [], token);
+      await page.locator("main").evaluate(node => { node.innerHTML = '<div data-turn-key="pending"><span hidden data-chatgpt-agent-turn-start></span></div>'; });
+      const binding = await worker.waitForNewAssistantTurn(page, baseline, Date.now() + 2_000);
+      await page.locator("main").evaluate((node, body) => {
+        node.innerHTML = '<div data-turn-key="persisted"><div data-user-message-bubble><div data-search-result-target>'
+          + body + '</div></div><span hidden data-chatgpt-agent-turn-start></span></div>';
+      }, html);
+      const group = page.locator('[data-turn-key="persisted"]');
+      expect(await worker.userMessageMatchesSubmission(group, baseline.submittedText, undefined, token), name).toBe(accepted);
+      if (accepted) expect((await worker.reconcileAssistantTurnBinding(page, baseline, binding)).identity, name)
+        .toBe("group:assistant:persisted");
       await page.close();
     }
   } finally { await browser.close(); }

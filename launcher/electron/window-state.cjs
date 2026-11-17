@@ -67,7 +67,7 @@ function normalizeWindowState(value, displays = []) {
 
 function readWindowState(filePath, displays = []) {
   try {
-    return normalizeWindowState(JSON.parse(fs.readFileSync(filePath, "utf8")), displays);
+    return normalizeWindowState(JSON.parse(fs.readFileSync(filePath, "utf8").replace(/^\uFEFF/, "")), displays);
   } catch {
     return normalizeWindowState(null, displays);
   }

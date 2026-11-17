@@ -1,10 +1,12 @@
-import { expect, test } from "bun:test";
+import { expect, spyOn, test } from "bun:test";
 import { mock } from "node:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import type { BrowserTurn } from "../src/adapters/chatgpt-web/browser-worker";
-import { ChatGptBrowserWorker } from "../src/adapters/chatgpt-web/browser-worker";
+import { ChatGptBrowserWorker, chatGptSuspensionClock } from "../src/adapters/chatgpt-web/browser-worker";
 import { ChatGptCompactionHandoffAccepted, ChatGptWebAdapterError, chatGptRetainedConversationUnavailableError } from "../src/adapters/chatgpt-web/adapter-error";
 import {
   MAX_COMPACTION_HANDOFF_TIMEOUT_MS,
@@ -89,7 +91,7 @@ function request(compaction = false): CodexParsedRequest {
 }
 
 function controlBinding(instruction: string): { token: string; handoffId: string } {
-  const token = instruction.match(/turn_token (control_[a-f0-9]{32})/)?.[1];
+  const token = instruction.match(/turn_token (turn_[a-f0-9]{32})/)?.[1];
   const handoffId = instruction.match(/handoff_id (handoff_[a-f0-9]{32})/)?.[1];
   if (!token || !handoffId) throw new Error(`Missing compaction control binding: ${instruction}`);
   return { token, handoffId };
@@ -157,12 +159,14 @@ test("compaction capability is one-shot and structurally bound to its handoff id
 
 test("retained compaction provides one exact same-agent control binding", () => {
   const prompt = structuredCompactionHandoffInstruction({
-    token: "control_11111111111111111111111111111111",
+    token: "turn_11111111111111111111111111111111",
     handoffId: "handoff_22222222222222222222222222222222",
-  });
+  }, "Codex app");
+  expect(prompt).toContain('selected ChatGPT plugin "Codex app"');
+  expect(prompt).not.toContain("Codex Native");
   expect(prompt).toContain("Automatic Codex context compaction has started.");
   expect(prompt).toContain("Stop ordinary task work");
-  expect(prompt).toContain("turn_token control_11111111111111111111111111111111");
+  expect(prompt).toContain("turn_token turn_11111111111111111111111111111111");
   expect(prompt).toContain("wire_name codex.control.compaction_handoff");
   expect(prompt).toContain('"handoff_id":"handoff_22222222222222222222222222222222"');
   expect(prompt).toContain("do not use it with codex_exec, codex_tool_inventory, or any outer Codex tool");
@@ -190,6 +194,75 @@ test("a compaction control token cannot claim the ordinary Codex tool environmen
     rmSync(root, { recursive: true, force: true });
   }
 });
+
+test("retained compaction submits through the published MCP contract with no ordinary tool authority", async () => {
+  const root = mkdtempSync(join(shortSocketTempRoot(), "cgw-compaction-mcp-"));
+  const broker = TurnBroker.forSocket(defaultBrokerEndpoint(root));
+  const client = new Client({ name: "compaction-contract-test", version: "1" });
+  const transport = new StdioClientTransport({
+    command: process.execPath,
+    args: ["src/cli.ts", "mcp", "--broker-socket", broker.socketPath],
+    cwd: process.cwd(), stderr: "pipe",
+  });
+  const sourceRequest = request(false);
+  const source = new ChatGptTurnSession({
+    mode: "read-only", browser: Promise.resolve("source complete"),
+    physicalSettlement: Promise.resolve(), trace: new ChatGptTraceFeed(), text: new ChatGptTextFeed(),
+    usageInput: sourceRequest, conversationKey: chatGptConversationKey(sourceRequest, "provider")!, cancel() {},
+  });
+  try {
+    await client.connect(transport);
+    const run = async (turn: BrowserTurn) => {
+      const prepared = await turn.prepare();
+      try {
+        const { token, handoffId } = controlBinding(prepared.text);
+        const result = await client.callTool({ name: "codex_tool_call", arguments: {
+          turn_token: token, wire_name: "codex.control.compaction_handoff",
+          arguments: { handoff_id: handoffId, summary: "Complete checkpoint sent through MCP" },
+        } });
+        if (result.isError) throw new Error(JSON.stringify(result.content));
+        return "Checkpoint submitted.";
+      } finally { prepared.release(); }
+    };
+    const summary = await requestRetainedCompactionHandoff(
+      { appName: "Codex app", run } as never, request(true), source, broker,
+      { localToolsEnabled: true, solAvailable: true, extraHighAvailable: true, proAvailable: true },
+      "trace_mcp_handoff",
+    );
+    expect(summary).toBe("Complete checkpoint sent through MCP");
+
+    const transaction = await broker.beginCompactionTransaction("trace_mcp_boundaries", 30_000);
+    for (const [name, args] of [
+      ["codex_exec", { cmd: "echo must-not-run" }],
+      ["codex_tool_inventory", {}],
+      ["codex_tool_call", { wire_name: "exec_command", arguments: { cmd: "echo must-not-run" } }],
+    ] as const) {
+      const denied = await client.callTool({ name, arguments: { turn_token: transaction.token, ...args } });
+      expect(denied.isError).toBeTrue();
+      expect(JSON.stringify(denied.content)).toContain("turn token is invalid");
+    }
+    const submit = (token: string, handoffId: string) => client.callTool({ name: "codex_tool_call", arguments: {
+      turn_token: token, wire_name: "codex.control.compaction_handoff",
+      arguments: { handoff_id: handoffId, summary: "Bound checkpoint" },
+    } });
+    const wrong = await submit(transaction.token, "handoff_wrong");
+    expect(wrong.isError).toBeTrue();
+    expect(JSON.stringify(wrong.content)).toContain("does not match");
+    const ordinary = await broker.register({ cwd: root, roots: [root], writableRoots: [root],
+      sandboxPolicy: { type: "dangerFullAccess" }, tools: [] }, 30_000);
+    expect((await submit(ordinary, transaction.handoffId)).isError).toBeTrue();
+    expect((await submit(transaction.token, transaction.handoffId)).isError).not.toBeTrue();
+    expect(await broker.waitForCompactionHandoff(transaction.token)).toBe("Bound checkpoint");
+    expect((await submit(transaction.token, transaction.handoffId)).isError).toBeTrue();
+    const aborted = await broker.beginCompactionTransaction("trace_mcp_aborted", 30_000);
+    broker.abortCompactionTransaction(aborted.token);
+    expect((await submit(aborted.token, aborted.handoffId)).isError).toBeTrue();
+  } finally {
+    await client.close();
+    await broker.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+}, 30_000);
 
 test("active compaction delivers the current result and converts every later MCP call into the checkpoint request", async () => {
   const root = mkdtempSync(join(shortSocketTempRoot(), "cgw-active-compaction-gate-"));
@@ -314,7 +387,7 @@ test.each(["5.6", "6"] as const)("a retained %s checkpoint preserves model selec
     beginCompactionTransaction: async (_traceId: string, ttlMs: number) => {
       transactionTtl = ttlMs;
       return {
-      token: "control_11111111111111111111111111111111",
+      token: "turn_11111111111111111111111111111111",
       handoffId: "handoff_22222222222222222222222222222222",
       };
     },
@@ -322,9 +395,11 @@ test.each(["5.6", "6"] as const)("a retained %s checkpoint preserves model selec
     abortCompactionTransaction: () => { transactionAborted = true; },
   } as unknown as TurnBroker;
   const worker = {
+    appName: "Codex app",
     run: async (turn: BrowserTurn): Promise<string> => {
       captured = turn;
       const prepared = await turn.prepareResume!();
+      expect(prepared.text).toContain('selected ChatGPT plugin "Codex app"');
       expect(prepared.text).toContain("wire_name codex.control.compaction_handoff");
       prepared.release();
       return await new Promise<string>((_resolve, reject) => {
@@ -374,13 +449,14 @@ test("completed retained compaction never treats ordinary assistant text as a ha
   });
   const broker = {
     beginCompactionTransaction: async () => ({
-      token: "control_11111111111111111111111111111111",
+      token: "turn_11111111111111111111111111111111",
       handoffId: "handoff_22222222222222222222222222222222",
     }),
     waitForCompactionHandoff: async () => { throw new Error("structured handoff missing"); },
     abortCompactionTransaction() {},
   } as unknown as TurnBroker;
   const worker = {
+    appName: "Codex app",
     run: async () => '{"checkpoint":"must never be parsed"}',
   };
 
@@ -407,7 +483,7 @@ test("a settled browser response without a checkpoint reports the missing handof
   const guard = setTimeout(() => abort.abort(new Error("test observation guard")), 1000);
   try {
     await expect(requestRetainedCompactionHandoff(
-      { run: async () => "The requested tool call did not run." } as never,
+      { appName: "Codex app", run: async () => "The requested tool call did not run." } as never,
       request(true), source, broker,
       { localToolsEnabled: true, solAvailable: true, extraHighAvailable: true, proAvailable: true },
       "trace_missing_handoff", abort.signal,
@@ -430,9 +506,9 @@ test("a checkpoint submitted before browser completion wins the terminal respons
   });
   try {
     await expect(requestRetainedCompactionHandoff(
-      { run: async (turn: BrowserTurn) => {
+      { appName: "Codex app", run: async (turn: BrowserTurn) => {
         const prepared = await turn.prepare();
-        const token = prepared.text.match(/turn_token (control_\w+)/)![1]!;
+        const token = prepared.text.match(/turn_token (turn_\w+)/)![1]!;
         const handoffId = prepared.text.match(/handoff_id (handoff_\w+)/)![1]!;
         await callTurnBroker(broker.socketPath, { method: "submit_compaction_handoff", token, handoffId, summary: "Exact summary" });
         prepared.release();
@@ -463,13 +539,14 @@ test("retained compaction deadline bounds browser settlement after the control h
   let transactionAborted = false;
   const broker = {
     beginCompactionTransaction: async () => ({
-      token: "control_11111111111111111111111111111111",
+      token: "turn_11111111111111111111111111111111",
       handoffId: "handoff_22222222222222222222222222222222",
     }),
     waitForCompactionHandoff: async () => "Already submitted checkpoint",
     abortCompactionTransaction: () => { transactionAborted = true; },
   } as unknown as TurnBroker;
   const worker = {
+    appName: "Codex app",
     run: async () => new Promise<string>(() => {}),
   };
 
@@ -505,6 +582,65 @@ test("a rejected exact compaction run is evicted while a successful run remains 
   await expect(retry).resolves.toBe("recovered checkpoint");
   await expect(existingStructuredCompactionRun(key)).resolves.toBe("recovered checkpoint");
   expect(starts).toBe(2);
+});
+
+test("an exact oversized compaction replays its size error instead of uploading the same parts again", async () => {
+  const root = mkdtempSync(join(shortSocketTempRoot(), "cgw-size-compact-"));
+  const provider: CodexProviderConfig = {
+    adapter: "chatgpt-web",
+    baseUrl: `browser://oversized-${crypto.randomUUID()}`,
+    chatgptWeb: {
+      browserHost: "launcher",
+      browserHostDescriptorPath: join(root, "launcher.json"),
+      brokerSocketPath: defaultBrokerEndpoint(root),
+      localToolsEnabled: true,
+      solAvailable: true,
+      proAvailable: true,
+      experimentalBiggerContext: true,
+      experimentalFreshConversationPerTurn: true,
+    },
+  };
+  const worker = ChatGptBrowserWorker.forProvider(provider);
+  const originalRun = worker.run;
+  let browserStarts = 0;
+  worker.run = async turn => {
+    browserStarts++;
+    const prepared = await turn.prepare();
+    prepared.release();
+    throw new ChatGptWebAdapterError("The submitted message is too long", {
+      status: 400, errorType: "invalid_request_error", code: "context_length_exceeded", retryable: false,
+    });
+  };
+  const adapter = createChatGptWebAdapter(provider);
+  const observe = async (input: CodexParsedRequest) => {
+    const events: AdapterEvent[] = [];
+    await adapter.runTurn!(input, { headers: new Headers() }, event => events.push(event));
+    expect(events.at(-1)).toMatchObject({
+      type: "error", status: 400, code: "context_length_exceeded", retryable: false,
+    });
+    expect(events.some(event => event.type === "done")).toBeFalse();
+  };
+  try {
+    await observe(request(true));
+    await Bun.sleep(0);
+    await observe(request(true));
+    expect(browserStarts).toBe(1);
+
+    // Changed input and model selection must reach the browser again.
+    const revised = request(true);
+    revised.context.messages.at(-1)!.content = "Continue";
+    (revised._rawBody as { input: Array<{ content: Array<{ text: string }> }> }).input[0]!.content[0]!.text = "Continue";
+    await observe(revised);
+    expect(browserStarts).toBe(2);
+    const otherMode = request(true);
+    otherMode.options.reasoning = "max";
+    await observe(otherMode);
+    expect(browserStarts).toBe(3);
+  } finally {
+    worker.run = originalRun;
+    await TurnBroker.forSocket(provider.chatgptWeb!.brokerSocketPath!).close();
+    rmSync(root, { recursive: true, force: true });
+  }
 });
 
 test("operator cancellation aborts the shared structured compaction owner", async () => {
@@ -1409,7 +1545,8 @@ test.each([false, true])("fresh multipart compaction preserves phase budgets wit
     return "Fallback checkpoint after separately bounded phases";
   };
   const events: AdapterEvent[] = [];
-  mock.timers.enable({ apis: ["setTimeout"] });
+  mock.timers.enable({ apis: ["setTimeout", "Date"] });
+  const clockNow = spyOn(performance, "now").mockImplementation(() => Date.now());
   try {
     await createChatGptWebAdapter(provider).runTurn!(
       request(true),
@@ -1420,10 +1557,80 @@ test.each([false, true])("fresh multipart compaction preserves phase budgets wit
       && event.text.includes("Fallback checkpoint after separately bounded phases"))).toBeTrue();
     expect(events.at(-1)).toMatchObject({ type: "done", stopReason: "stop", endTurn: true });
   } finally {
+    clockNow.mockRestore();
     mock.timers.reset();
     (worker as unknown as { run: (turn: BrowserTurn) => Promise<string> }).run = originalRun;
     await TurnBroker.forSocket(provider.chatgptWeb!.brokerSocketPath!).close();
     rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("compaction survives process suspension but still expires after awake inactivity", async () => {
+  for (const completeAfterWake of [true, false]) {
+    const root = mkdtempSync(join(shortSocketTempRoot(), "cgw-compaction-suspension-"));
+    const provider: CodexProviderConfig = {
+      adapter: "chatgpt-web", baseUrl: `browser://compaction-suspension-${root}`,
+      chatgptWeb: {
+        browserHost: "launcher", browserHostDescriptorPath: join(root, "launcher.json"),
+        brokerSocketPath: defaultBrokerEndpoint(root), localToolsEnabled: true,
+        solAvailable: true, extraHighAvailable: true, proAvailable: true,
+      },
+    };
+    const worker = ChatGptBrowserWorker.forProvider(provider);
+    const originalRun = worker.run;
+    let started!: () => void;
+    const ready = new Promise<void>(resolve => { started = resolve; });
+    let finish!: (summary: string) => void;
+    const browser = new Promise<string>(resolve => { finish = resolve; });
+    let signal: AbortSignal | undefined;
+    let browserStarts = 0;
+    worker.run = async turn => {
+      browserStarts++;
+      signal = turn.abortSignal;
+      turn.onSubmitted?.();
+      started();
+      return browser;
+    };
+    const events: AdapterEvent[] = [];
+    // No interval ticks run during the jump: both processes were frozen in #863.
+    mock.timers.enable({ apis: ["setTimeout", "Date"] });
+    const time = spyOn(performance, "now").mockImplementation(() => Date.now());
+    const run = createChatGptWebAdapter(provider).runTurn!(
+      request(true), { headers: new Headers() }, event => events.push(event),
+    );
+    try {
+      await ready;
+      mock.timers.tick(600_000);
+      await Bun.sleep(1);
+      expect(signal?.aborted).toBeFalse();
+      expect(events.some(event => event.type === "error")).toBeFalse();
+      expect(browserStarts).toBe(1);
+      if (!completeAfterWake) {
+        // The process is awake again, but ChatGPT produces no activity.
+        for (let i = 0; i < 300; i++) {
+          chatGptSuspensionClock.tick(performance.now());
+          mock.timers.tick(1_000);
+        }
+        await Bun.sleep(1);
+        expect(signal?.aborted).toBeTrue();
+        expect(events.at(-1)).toMatchObject({ type: "error", code: "compaction_handoff_timeout" });
+      }
+      finish("Checkpoint completed after the process resumed");
+      await run;
+      if (completeAfterWake) {
+        expect(events.some(event => event.type === "text_delta"
+          && event.text.includes("Checkpoint completed after the process resumed"))).toBeTrue();
+        expect(events.at(-1)).toMatchObject({ type: "done", stopReason: "stop", endTurn: true });
+      }
+    } finally {
+      finish("test cleanup");
+      await run;
+      time.mockRestore();
+      mock.timers.reset();
+      worker.run = originalRun;
+      await TurnBroker.forSocket(provider.chatgptWeb!.brokerSocketPath!).close();
+      rmSync(root, { recursive: true, force: true });
+    }
   }
 });
 
@@ -1481,6 +1688,7 @@ test("cancel-all waits for physical settlement of a fresh compaction fallback", 
 });
 
 test("a timed-out fresh compaction retains its owner until helper cleanup completes", async () => {
+  const warnings = spyOn(console, "warn").mockImplementation(() => {});
   const root = mkdtempSync(join(shortSocketTempRoot(), "cgw-timeout-cleanup-"));
   const provider: CodexProviderConfig = {
     adapter: "chatgpt-web",
@@ -1507,6 +1715,8 @@ test("a timed-out fresh compaction retains its owner until helper cleanup comple
   (worker as unknown as { run: (turn: BrowserTurn) => Promise<string> }).run = async turn => {
     browserStarts += 1;
     fallbackTrace = turn.traceId;
+    await turn.onMultipartStageAcknowledged?.(1);
+    turn.onGenerationProgress?.();
     started();
     turn.abortSignal!.addEventListener("abort", () => { cancelled = true; }, { once: true });
     await physicalSettlement;
@@ -1520,7 +1730,8 @@ test("a timed-out fresh compaction retains its owner until helper cleanup comple
     runs.push(run);
     return run;
   };
-  mock.timers.enable({ apis: ["setTimeout"] });
+  mock.timers.enable({ apis: ["setTimeout", "Date"] });
+  const clockNow = spyOn(performance, "now").mockImplementation(() => Date.now());
   try {
     void observe();
     await ready;
@@ -1528,6 +1739,16 @@ test("a timed-out fresh compaction retains its owner until helper cleanup comple
     await Bun.sleep(5);
     expect(cancelled).toBeTrue();
     expect(events.filter(event => event.type === "error")).toHaveLength(1);
+    const timeoutLog = warnings.mock.calls.map(([line]) => String(line))
+      .find(line => line.startsWith("[chatgpt-web] compaction_timeout "))!;
+    expect(JSON.parse(timeoutLog.slice(timeoutLog.indexOf("{")))).toMatchObject({
+      phase: "fresh_compaction",
+      timeoutMs: 40,
+      lastActivity: "generation",
+      acknowledgedParts: 1,
+      elapsedMs: expect.any(Number),
+      idleMs: expect.any(Number),
+    });
     await observe();
     let cleanupSettled = false;
     const cleanup = cancelStructuredCompactionTrace(fallbackTrace, new Error("wait for timeout cleanup"))
@@ -1546,7 +1767,9 @@ test("a timed-out fresh compaction retains its owner until helper cleanup comple
   } finally {
     releasePhysical();
     await Promise.allSettled(runs);
+    clockNow.mockRestore();
     mock.timers.reset();
+    warnings.mockRestore();
     (worker as unknown as { run: (turn: BrowserTurn) => Promise<string> }).run = originalRun;
     await TurnBroker.forSocket(provider.chatgptWeb!.brokerSocketPath!).close();
     rmSync(root, { recursive: true, force: true });
@@ -1678,7 +1901,7 @@ test("a disappeared retained source cannot leave its fresh compaction rebuild pa
       type: "error",
       code: "compaction_handoff_timeout",
       retryable: false,
-      message: "ChatGPT compaction did not fully settle within 25ms",
+      message: "ChatGPT compaction had no observed activity for 25ms",
     });
   } finally {
     releaseBrowser?.();
@@ -1724,7 +1947,8 @@ test("finishing the previous response does not consume the retained checkpoint's
     return "Checkpoint submitted";
   };
   const events: AdapterEvent[] = [];
-  mock.timers.enable({ apis: ["setTimeout"] });
+  mock.timers.enable({ apis: ["setTimeout", "Date"] });
+  const clockNow = spyOn(performance, "now").mockImplementation(() => Date.now());
   let run: Promise<void> | undefined;
   try {
     run = createChatGptWebAdapter(provider).runTurn!(request(true), { headers: new Headers() }, event => events.push(event));
@@ -1737,6 +1961,7 @@ test("finishing the previous response does not consume the retained checkpoint's
   } finally {
     finishSource("cleanup");
     await run;
+    clockNow.mockRestore();
     mock.timers.reset();
     worker.run = originalRun;
     chatGptTurnSessions.clear();
@@ -1780,7 +2005,8 @@ test.each([false, true])("compaction source progress renews waiting, but silent 
     return "Checkpoint submitted";
   };
   const events: AdapterEvent[] = [];
-  mock.timers.enable({ apis: ["setTimeout"] });
+  mock.timers.enable({ apis: ["setTimeout", "Date"] });
+  const clockNow = spyOn(performance, "now").mockImplementation(() => Date.now());
   let run: Promise<void> | undefined;
   try {
     run = createChatGptWebAdapter(provider).runTurn!(request(true), { headers: new Headers() }, event => events.push(event));
@@ -1802,6 +2028,7 @@ test.each([false, true])("compaction source progress renews waiting, but silent 
   } finally {
     finishSource("cleanup");
     await run;
+    clockNow.mockRestore();
     mock.timers.reset();
     worker.run = originalRun;
     chatGptTurnSessions.clear();

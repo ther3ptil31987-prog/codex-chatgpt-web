@@ -1,22 +1,27 @@
 import { expect, test } from "bun:test";
 import { ChatGptBrowserWorker } from "../src/adapters/chatgpt-web/browser-worker";
+import { CHATGPT_COMPOSER_SELECTOR } from "../src/chatgpt-ui/composer";
 import {
-  CHATGPT_COMPOSER_SELECTOR,
   CHATGPT_EFFORT_CONTROL_SELECTOR,
   CHATGPT_EFFORT_MENU_SELECTOR,
   CHATGPT_EFFORT_SLIDER_CONTAINER_SELECTOR,
   activateChatGptEffortMenu,
+} from "../src/chatgpt-ui/model-picker";
+import {
   assertNewChatPage,
   chatGptNewChatUrl,
+  CHATGPT_NEW_CHAT_URL,
   detectChatGptAccountCapabilities,
 } from "../src/chatgpt-session";
 
-test("saved chats start empty and cannot reuse an arbitrary conversation or a Temporary Chat", async () => {
-  expect(chatGptNewChatUrl()).toBe("https://chatgpt.com/?temporary-chat=true");
-  expect(chatGptNewChatUrl(true)).toBe("https://chatgpt.com/");
+test.each([false, true])("new chats use the explicit mode and reject other surfaces (temporary=%s)", async useTemporaryChats => {
+  expect(CHATGPT_NEW_CHAT_URL).toBe("https://chatgpt.com/");
+  expect(chatGptNewChatUrl()).toBe(CHATGPT_NEW_CHAT_URL);
+  const target = useTemporaryChats ? "https://chatgpt.com/?temporary-chat=true" : CHATGPT_NEW_CHAT_URL;
+  expect(chatGptNewChatUrl(useTemporaryChats)).toBe(target);
   const prepare = (ChatGptBrowserWorker.prototype as any).prepareChatSurface;
-  for (const saved of [false, true]) {
-    let url = "https://chatgpt.com/c/previous-task";
+  for (const initial of ["https://chatgpt.com/c/previous-task", "https://chatgpt.com/?temporary-chat=true", "about:blank", CHATGPT_NEW_CHAT_URL]) {
+    let url = initial;
     const navigations: string[] = [];
     const absent: any = { filter: () => absent, last: () => absent, isVisible: async () => false };
     const composer: any = { count: async () => 1, nth: () => composer, isVisible: async () => true };
@@ -25,11 +30,13 @@ test("saved chats start empty and cannot reuse an arbitrary conversation or a Te
       goto: async (next: string) => { url = next; navigations.push(next); },
       locator: (selector: string) => selector === CHATGPT_COMPOSER_SELECTOR ? composer : absent,
     };
-    expect(await prepare.call({ activeComposer: async () => composer }, page, undefined, saved)).toBe(composer);
-    expect(navigations).toEqual([chatGptNewChatUrl(saved)]);
-    await expect(assertNewChatPage(page, !saved)).rejects.toThrow("requested new");
-    url = "https://chatgpt.com/c/previous-task";
-    await expect(assertNewChatPage(page, saved)).rejects.toThrow("requested new");
+    expect(await prepare.call({ config: { useTemporaryChats }, activeComposer: async () => composer }, page)).toBe(composer);
+    expect(navigations).toEqual(initial === target ? [] : [target]);
+    await expect(assertNewChatPage(page, useTemporaryChats)).resolves.toBeUndefined();
+    for (const invalid of ["https://chatgpt.com/c/previous-task", chatGptNewChatUrl(!useTemporaryChats), "https://example.com/"]) {
+      url = invalid;
+      await expect(assertNewChatPage(page, useTemporaryChats)).rejects.toThrow("requested new chat");
+    }
   }
 });
 
@@ -53,6 +60,23 @@ test("composer and effort selectors exclude unrelated editable fields and menu b
   const matches = (selector: string) => Array.from(document.querySelectorAll(selector)).map(element => element.id);
   expect(matches(CHATGPT_COMPOSER_SELECTOR)).toEqual(["composer-testid", "prompt-textarea", "composer-lexical", "power-editor"]);
   expect(matches(CHATGPT_EFFORT_CONTROL_SELECTOR)).toEqual(["effort", "model", "power-effort"]);
+});
+
+// 2026-10-29, #924: the trigger lost all three older identifying attributes.
+test.each(["选择 ChatGPT 模型", "Select ChatGPT model", ""])("inline reasoning control is structural, independent of label (%s)", label => {
+  const { createDocument } = require("@mixmark-io/domino") as { createDocument(html: string): Document };
+  const document = createDocument(`<form>
+    <button type="button" aria-label="${label}" aria-haspopup="menu"
+      data-composer-navigation-target="reasoning" data-selected-reasoning-effort="max" id="inline">思考强度</button>
+    <button aria-haspopup="menu" data-composer-navigation-target="reasoning"></button>
+    <button aria-haspopup="menu" data-selected-reasoning-effort="max"></button>
+    <button data-composer-navigation-target="reasoning" data-selected-reasoning-effort="max"></button>
+    <button aria-haspopup="dialog" data-composer-navigation-target="reasoning" data-selected-reasoning-effort="max"></button>
+    <button aria-haspopup="menu" data-composer-navigation-target="attachments" data-selected-reasoning-effort="max"></button>
+    <button aria-label="${label}" aria-haspopup="menu"></button>
+    <div role="button" aria-haspopup="menu" data-composer-navigation-target="reasoning" data-selected-reasoning-effort="max"></div>
+  </form>`);
+  expect(Array.from(document.querySelectorAll(CHATGPT_EFFORT_CONTROL_SELECTOR)).map(element => element.id)).toEqual(["inline"]);
 });
 
 test("effort activation binds the owned menu after the control opens", async () => {
@@ -182,15 +206,18 @@ test("effort activation fails closed when neither event exposes a structural sur
     .rejects.toThrow("did not expose its owned menu or structural slider");
 });
 
-test("a complete authenticated composer with no effort selector is Luna-only", async () => {
+test("an authenticated composer without recognized model controls cannot be classified as Luna-only", async () => {
   const effortButton = {
     filter() { return this; },
+    or() { return this; },
+    count: async () => 0,
     last() { return this; },
     isVisible: async () => false,
   };
   const composerForm = {
     count: async () => 1,
     locator: () => effortButton,
+    getByRole: () => effortButton,
   };
   const composer = {
     filter() { return this; },
@@ -207,13 +234,15 @@ test("a complete authenticated composer with no effort selector is Luna-only", a
   await expect(detectChatGptAccountCapabilities(page as never, {
     selectorTimeoutMs: 100,
     stableAbsenceMs: 0,
-  })).resolves.toEqual({ solAvailable: false, extraHighAvailable: false, proAvailable: false });
+  })).rejects.toThrow("Could not identify ChatGPT's model controls");
 });
 
-test("a transient effort control does not turn a Luna-only account into Sol", async () => {
+test("a transient effort control cannot establish either paid or Luna capabilities", async () => {
   let visibilityReads = 0;
   const effortButton = {
     filter() { return this; },
+    or() { return this; },
+    count: async () => 0,
     last() { return this; },
     isVisible: async () => {
       visibilityReads += 1;
@@ -223,6 +252,7 @@ test("a transient effort control does not turn a Luna-only account into Sol", as
   const composerForm = {
     count: async () => 1,
     locator: () => effortButton,
+    getByRole: () => effortButton,
   };
   const composers = {
     filter() { return this; },
@@ -238,7 +268,7 @@ test("a transient effort control does not turn a Luna-only account into Sol", as
   await expect(detectChatGptAccountCapabilities(page as never, {
     selectorTimeoutMs: 100,
     stableAbsenceMs: 0,
-  })).resolves.toEqual({ solAvailable: false, extraHighAvailable: false, proAvailable: false });
+  })).rejects.toThrow("Could not identify ChatGPT's model controls");
   expect(visibilityReads).toBe(2);
 });
 
@@ -296,7 +326,7 @@ function reasoningPicker(options: { max?: string; locks?: Array<string | null>; 
   const modelRows = { count: async () => 3, first() { return this; }, waitFor: async () => {}, nth: () => { throw new Error("Model rows are not effort choices"); } };
   const menu = { filter() { return this; }, last() { return this; }, isVisible: async () => true, locator: () => modelRows };
   const page = {
-    url: () => "https://chatgpt.com/?temporary-chat=true",
+    url: () => "https://chatgpt.com/",
     evaluate: async () => true,
     locator: (selector: string) => {
       if (selector === CHATGPT_COMPOSER_SELECTOR) return composer;
@@ -330,6 +360,18 @@ test("an effort-control observation failure cannot become a Luna-only detection"
     selectorTimeoutMs: 100,
     stableAbsenceMs: 0,
   })).rejects.toThrow("Ambiguous effort controls");
+});
+
+test("cancelling a missing model-control probe does not return Luna capabilities", async () => {
+  const fixture = reasoningPicker();
+  fixture.control.isVisible = async () => false;
+  const abort = new AbortController();
+  const timer = setTimeout(() => abort.abort(), 10);
+  try {
+    const failure = await detectChatGptAccountCapabilities(fixture.page as never, { signal: abort.signal })
+      .then(() => undefined, (error: unknown) => error);
+    expect(failure).toMatchObject({ name: "AbortError" });
+  } finally { clearTimeout(timer); }
 });
 
 test.each([0, 50])("capabilities wait for the visible container and read its hidden semantic input (delay=%s)", async delay => {
@@ -402,6 +444,102 @@ test("power picker omission of lock attributes requires its enabled structural o
     { power: true, max: "3" },
   ]) await expect(detectChatGptAccountCapabilities(reasoningPicker({ ...options, locks: Array(5).fill(null) }).page as never))
     .rejects.toThrow("availability");
+});
+
+test("capability detection activates a closed Radix effort control and captures slider failures before Escape", async () => {
+  let ghostOpen = false;
+  let pointerOpened = false;
+  const events: string[] = [];
+  const slider = {
+    waitFor: async ({ state }: { state: string }) => { expect(state).toBe("attached"); },
+  };
+  const sliderContainer = {
+    filter() { return this; },
+    locator: () => slider,
+    isVisible: async () => pointerOpened,
+    waitFor: async ({ state }: { state: string }) => {
+      expect(state).toBe("visible");
+      expect(pointerOpened).toBe(true);
+    },
+    evaluate: async (read: (element: Element) => unknown) => {
+      const { createDocument } = require("@mixmark-io/domino") as { createDocument(html: string): Document };
+      const document = createDocument(`<div data-model-reasoning-effort-slider>
+        <span data-orientation="horizontal" aria-disabled="true">
+          <span data-selected="true"></span>
+          <span data-selected="false"></span>
+          <span data-selected="false"></span>
+        </span>
+        <span role="slider" aria-valuemin="0" aria-valuemax="2" aria-valuenow="0"></span>
+      </div>`);
+      return read(document.querySelector("[data-model-reasoning-effort-slider]")!);
+    },
+  };
+  const ownedMenu = { isVisible: async () => pointerOpened };
+  const hiddenSurface = {
+    filter() { return this; },
+    last() { return this; },
+    locator() { return this; },
+    isVisible: async () => false,
+  };
+  const control = {
+    filter() { return this; },
+    isVisible: async () => true,
+    press: async () => { throw new Error("Capability detection must not rely on Enter to open Radix menus"); },
+    getAttribute: async (name: string) => {
+      if (name === "aria-controls") return pointerOpened ? "radix-effort-menu" : null;
+      if (name === "aria-expanded") return ghostOpen ? "true" : "false";
+      if (name === "data-state") return ghostOpen ? "open" : "closed";
+      return null;
+    },
+    click: async () => {
+      events.push("click");
+      ghostOpen = true;
+    },
+    dispatchEvent: async (name: string) => {
+      events.push(name);
+      ghostOpen = true;
+      pointerOpened = true;
+    },
+  };
+  const composer = {
+    filter() { return this; },
+    count: async () => 1,
+    locator: () => ({ count: async () => 1, locator: () => control }),
+  };
+  const page = {
+    evaluate: async () => true,
+    locator: (selector: string) => {
+      if (selector === CHATGPT_COMPOSER_SELECTOR) return composer;
+      if (selector === '[id="radix-effort-menu"]') return ownedMenu;
+      if (selector === CHATGPT_EFFORT_SLIDER_CONTAINER_SELECTOR) return sliderContainer;
+      return hiddenSurface;
+    },
+    keyboard: {
+      press: async (key: string) => {
+        events.push(`key:${key}`);
+        ghostOpen = false;
+        pointerOpened = false;
+      },
+    },
+  };
+
+  await expect(detectChatGptAccountCapabilities(page as never, {
+    settleMs: 0,
+    onFailureBeforeCleanup: async error => {
+      expect(error).toBeInstanceOf(Error);
+      expect((error as Error).message).toContain("slider ticks");
+      expect(pointerOpened).toBe(true);
+      events.push("captured-while-open");
+    },
+  })).rejects.toThrow("ChatGPT effort availability could not be verified from its slider ticks");
+
+  expect(events).toEqual([
+    "click",
+    "key:Escape",
+    "pointerdown",
+    "captured-while-open",
+    "key:Escape",
+  ]);
 });
 
 test("stale saved capabilities cannot activate a locked effort; High remains selectable", async () => {

@@ -33,7 +33,12 @@ test.each([
   let freshChatPreparations = 0;
   let rejectionAbortedWait = false;
   const frame = {};
-  const page = Object.assign(new EventEmitter(), { evaluate: async () => ({}), isClosed: () => false, mainFrame: () => frame });
+  const page = Object.assign(new EventEmitter(), {
+    evaluate: async () => ({}),
+    evaluateHandle: async () => ({ evaluate: async () => false, dispose: async () => {} }),
+    isClosed: () => false,
+    mainFrame: () => frame,
+  });
   const worker = Object.assign(Object.create(ChatGptBrowserWorker.prototype), {
     config: { appName: "Codex Native2", browserDiagnosticsPath: diagnostics, ...(owned ? { browserHostDescriptorPath: "owned-descriptor" } : {}) },
     runStage: async (_trace: string, name: string, timeout: number, action: (signal: AbortSignal) => Promise<unknown>) => {

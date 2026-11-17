@@ -357,9 +357,9 @@ export async function runDevCommand(args: string[]): Promise<void> {
     const skillAttachments = takeFlag(args, "--skill-attachments");
     const inlineSkills = takeFlag(args, "--inline-skills");
     if (skillAttachments && inlineSkills) throw new Error("Choose --skill-attachments or --inline-skills");
-    const savedChats = takeFlag(args, "--saved-chats");
     const temporaryChats = takeFlag(args, "--temporary-chats");
-    if (savedChats && temporaryChats) throw new Error("Choose --saved-chats or --temporary-chats");
+    const ordinaryChats = takeFlag(args, "--ordinary-chats");
+    if (temporaryChats && ordinaryChats) throw new Error("Choose --temporary-chats or --ordinary-chats");
     const freshConversation = takeFlag(args, "--fresh-conversation");
     const retainedConversation = takeFlag(args, "--retained-conversation");
     if (freshConversation && retainedConversation) {
@@ -383,8 +383,8 @@ export async function runDevCommand(args: string[]): Promise<void> {
       ...(biggerContext || standardContext ? { experimentalBiggerContext: biggerContext } : {}),
       ...(predictions || noPredictions ? { composerPredictionsEnabled: predictions } : {}),
       ...(skillAttachments || inlineSkills ? { experimentalSkillAttachments: skillAttachments } : {}),
+      ...(temporaryChats || ordinaryChats ? { useTemporaryChats: temporaryChats } : {}),
       ...(freshConversation || retainedConversation ? { experimentalFreshConversationPerTurn: freshConversation } : {}),
-      ...(savedChats || temporaryChats ? { useSavedChats: savedChats } : {}),
       ...(tunnelId ? { tunnelId } : {}),
       ...(runtimeKeyFile ? { runtimeKeyFile } : {}),
     });

@@ -2557,6 +2557,24 @@ code {
   gap: 7px;
 }
 
+.session-reminder-overlay {
+  padding: 8px;
+}
+
+.session-reminder-overlay .session-refresh-reminder {
+  position: relative;
+  inset: auto;
+  width: 100%;
+}
+
+.session-reminder-error {
+  margin: 0;
+  padding: 8px 14px;
+  border-radius: var(--radius-md);
+  background: var(--color-background-elevated);
+  color: var(--color-text-error);
+}
+
 .bigger-context-recommendation-backdrop {
   position: fixed;
   z-index: 450;

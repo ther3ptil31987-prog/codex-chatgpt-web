@@ -16,6 +16,7 @@ import { responsesRequestSchema } from "./schema";
 import { compactionItemToText, isNativeTextCompaction } from "./compaction";
 import { previousResponseReplayPrefixLength } from "./state";
 import { decodeReasoningEnvelope } from "./reasoning-envelope";
+import { readNativeThreadDelegation } from "./native-context";
 
 function isObj(v: unknown): v is Record<string, unknown> {
   return typeof v === "object" && v !== null && !Array.isArray(v);
@@ -560,6 +561,12 @@ export function parseRequest(body: unknown): CodexParsedRequest {
 
       if (effectiveType === "function_call_output") {
         pendingReasoning.length = 0;
+        const delegation = readNativeThreadDelegation(item as Record<string, unknown>);
+        if (delegation) {
+          messages.push({ role: "agentMessage", author: delegation.sourceThreadId,
+            content: delegation.output, timestamp: now });
+          continue;
+        }
         const output = item as { call_id: string; output?: string | unknown[] };
         const toolInfo = findToolById(messages, output.call_id);
         messages.push({

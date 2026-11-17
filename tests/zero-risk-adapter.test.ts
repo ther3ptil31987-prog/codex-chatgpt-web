@@ -103,6 +103,7 @@ for (const scenario of [
   const { BrowserHost } = require("../launcher/electron/browser-host.cjs");
   const { BrowserControlServer } = require("../launcher/electron/control-server.cjs");
   const config = provider(`compaction-owner-${scenario.format}-${scenario.finalWins}`);
+  config.chatgptWeb!.appName = "Codex Manual Work";
   const socket = config.chatgptWeb!.brokerSocketPath!;
   const broker = TurnBroker.forSocket(socket);
   const logs: string[] = [];
@@ -143,6 +144,7 @@ for (const scenario of [
   let modelAction: Promise<void> | undefined;
   const control: ChatGptZeroRiskManualControl = {
     async start(_path, activity) {
+      expect(activity.prompt).toContain('The selected local Codex plugin for this turn is "Codex Manual Work".');
       host.beginManualTurn(activity.traceId, activity.helperPid, activity.prompt,
         activity.conversationKey, activity.resumePrompt, activity.compaction);
       starts.push(activity.traceId);
@@ -448,6 +450,7 @@ test("a Zero Risk launcher failure remains failed when its own capability cleanu
 
 test("Zero Risk offers only the new Codex suffix when the launcher reuses its retained ChatGPT chat", async () => {
   const config = provider("incremental-resume");
+  config.chatgptWeb!.appName = "Codex Manual Work";
   const broker = TurnBroker.forSocket(config.chatgptWeb!.brokerSocketPath!);
   const input = request("turn_safe_incremental");
   input.context.messages.push(
@@ -481,6 +484,9 @@ test("Zero Risk offers only the new Codex suffix when the launcher reuses its re
     async start(_path, activity) {
       fullPrompt = activity.prompt;
       resumePrompt = activity.resumePrompt ?? "";
+      for (const prompt of [fullPrompt, resumePrompt]) {
+        expect(prompt).toContain('The selected local Codex plugin for this turn is "Codex Manual Work".');
+      }
       exactBinding = binding(resumePrompt);
     },
     async waitSent() {

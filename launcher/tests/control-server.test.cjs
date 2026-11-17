@@ -563,7 +563,7 @@ test("manual-to-automatic transaction exposes capability inspection and preserve
       inspections += 1;
       assert.equal(detectCapabilities, true);
       assert.equal(host.browserInteractionMode(), "automatic");
-      return { authenticated: true, temporary: true, url: "https://chatgpt.com/" };
+      return { authenticated: true, newChat: true, url: "https://chatgpt.com/" };
     },
     removeTurnTab(tab, abortRunning) {
       assert.equal(abortRunning, false);

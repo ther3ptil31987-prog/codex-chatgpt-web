@@ -29,6 +29,27 @@ function request(reasoning: "low" | "medium" | "high" | "xhigh" | "max"): CodexP
   };
 }
 
+test("custom plugin identity stays explicit in inline and multipart execution without rewriting task history", () => {
+  const capabilities = { localToolsEnabled: true, solAvailable: true, extraHighAvailable: true, proAvailable: true };
+  const parsed = request("high");
+  parsed.context.messages[1]!.content = "Compare Codex Native2 with the selected plugin.";
+  for (const appName of ["Codex app", "Codex Native2 DEV", "Codex Робота"]) {
+    for (const parts of [undefined, 2, 6] as const) {
+      const compiled = compileChatGptWebPrompt(parsed, capabilities, "turn_12345678901234567890123456789012", {
+        appName, experimentalMultipartParts: parts,
+      });
+      const contract = compiled.multipart?.commit ?? compiled.text;
+      expect(contract).toContain(`The selected local Codex plugin for this turn is ${JSON.stringify(appName)}.`);
+      expect(contract).toContain("Do not substitute another plugin for this local connection");
+      expect(contract).not.toContain("attached Codex Native tools");
+      const history = compiled.multipart
+        ? compiled.multipart.parts.flatMap(part => JSON.parse(part).records).filter(record => record.kind === "message").map(record => record.message)
+        : JSON.parse(compiled.text.match(/<codex_context_json>\n(.+)\n<\/codex_context_json>/s)![1]!).messages;
+      expect(history[1].content).toBe(parsed.context.messages[1]!.content);
+    }
+  }
+});
+
 test("inline and staged history escape Markdown delimiters without changing decoded code", () => {
   const parsed = request("high");
   const code = '```ts\nconst value = "`key`";\n``` '.repeat(20) + '\\u0060 \\` [text](https://example.com) 中文';
@@ -53,6 +74,38 @@ test("inline and staged history escape Markdown delimiters without changing deco
     .toEqual(decoded.messages[1].content);
   // A literal escape in source code stays literal; it is not decoded into a backtick twice.
   expect(decoded.messages[1].content).toContain("\\u0060");
+});
+
+test("multipart JSON shields the rich user renderer's delimiters while preserving every decoded value", () => {
+  const parsed = request("high");
+  // The harmless source from #886 changed after Send despite an exact stage acknowledgement.
+  const content = 'Use "quoted text", <placeholder>, **bold**, _name_, ~~old~~, [label](https://example.com).\n\n### Heading\nC:\\tmp\\file\n'.repeat(700)
+    + 'Literal \\u0022 \\u005c \\n; Unicode 中文 😀; tab\t and CR\r.';
+  parsed.context.systemPrompt = [content];
+  parsed.context.messages[1]!.content = content;
+  const capabilities = { localToolsEnabled: true, solAvailable: true, extraHighAvailable: true, proAvailable: true };
+  const token = "turn_12345678901234567890123456789012";
+  const inline = compileChatGptWebPrompt(parsed, capabilities, token);
+  const inlineJson = inline.text.match(/<codex_context_json>\n(.+)\n<\/codex_context_json>/s)![1]!;
+  expect(inlineJson).toContain("https://example.com");
+  expect(JSON.parse(inlineJson).system).toEqual([content]);
+  for (const parts of [2, 6] as const) {
+    const compiled = compileChatGptWebPrompt(parsed, capabilities, token, { experimentalMultipartParts: parts });
+    const records = compiled.multipart!.parts.flatMap(payload => {
+      expect(payload).not.toContain('\\"quoted text\\"');
+      expect(payload).not.toContain("<placeholder>");
+      expect(payload).not.toContain("**bold**");
+      expect(payload).not.toContain("_name_");
+      expect(payload).not.toContain("~~old~~");
+      expect(payload).not.toContain("[label]");
+      expect(payload).not.toContain("https:");
+      expect(payload).not.toContain("### Heading");
+      expect(payload).not.toContain("C:\\\\tmp");
+      return JSON.parse(payload).records;
+    });
+    expect(records.find(record => record.kind === "system").content).toBe(content);
+    expect(records.find(record => record.kind === "message" && record.message_index === 1).message.content).toBe(content);
+  }
 });
 
 test("history handle cleanup works on decoded text and preserves native call identities", () => {
@@ -91,15 +144,15 @@ test("Full-mode Pro prompts pass one stable turn token directly to native action
   expect(resume).toBeGreaterThan(envelopeEnd);
   expect(tokenMatches).toHaveLength(1);
   expect(compiled.text).toContain("[retired turn handle]");
-  expect(transportOnly).toContain("For local work required by the task, use the attached Codex Native tools directly according to their declared descriptions and schemas.");
-  expect(transportOnly).toContain("Call a Codex Native tool only when the latest active request requires a local effect or fresh local evidence that is not already present in the supplied context; otherwise answer the request directly without a tool call.");
-  expect(transportOnly).toContain("Use actual Codex Native results as evidence for local observations and effects.");
-  expect(transportOnly).toContain("A Codex Native MCP tool result may require context compaction. If it does, follow the compaction instructions in that result exactly.");
+  expect(transportOnly).toContain("For local work required by the task, use the selected plugin's tools directly according to their declared descriptions and schemas.");
+  expect(transportOnly).toContain("Call a local Codex tool only when the latest active request requires a local effect or fresh local evidence that is not already present in the supplied context; otherwise answer the request directly without a tool call.");
+  expect(transportOnly).toContain("Use actual results from the selected plugin as evidence for local observations and effects.");
+  expect(transportOnly).toContain("A tool result from the selected plugin may require context compaction. If it does, follow the compaction instructions in that result exactly.");
   expect(transportOnly).toContain("After a deterministic tool failure, update the working hypothesis from that result");
   expect(transportOnly).toContain("do not repeat the same call unless its inputs or observable state changed.");
   expect(transportOnly).toContain("Continue using the available tools until the requested work is complete and verified.");
   expect(transportOnly).toContain("Write the user-facing final answer only after the last required tool result has settled.");
-  expect(transportOnly).toContain(`The task context is complete. Pass turn_token ${token} unchanged to every Codex Native call in this response, including continuations after tool results; do not expose it in the answer. Execute the latest active user request now.`);
+  expect(transportOnly).toContain(`The task context is complete. Pass turn_token ${token} unchanged to every tool call through the selected local Codex plugin in this response, including continuations after tool results; do not expose it in the answer. Execute the latest active user request now.`);
   expect(transportOnly).not.toMatch(/codex_bind_turn|binding_id|outer_tool_gateway|command_tool/);
   expect(transportOnly).not.toMatch(/codex_exec|codex_write_stdin|codex_apply_patch|codex_view_image|codex_tool_inventory|codex\.control\.turn_complete/);
   expect(transportOnly).toContain("Do not claim a safety or permission block without an explicit tool result or platform error supporting it.");
@@ -115,8 +168,8 @@ test("Pro preserves the same native Codex delegation contract as Extra High", ()
   const extraHigh = compileChatGptWebPrompt(request("xhigh"), capabilities, token);
 
   for (const compiled of [pro, extraHigh]) {
-    expect(compiled.text).toContain("For local work required by the task, use the attached Codex Native tools directly according to their declared descriptions and schemas.");
-    expect(compiled.text).toContain(`Pass turn_token ${token} unchanged to every Codex Native call in this response`);
+    expect(compiled.text).toContain("For local work required by the task, use the selected plugin's tools directly according to their declared descriptions and schemas.");
+    expect(compiled.text).toContain(`Pass turn_token ${token} unchanged to every tool call through the selected local Codex plugin in this response`);
     expect(compiled.text).not.toContain("Complete this task directly in the current parent response.");
     expect(compiled.text).not.toContain("Do not create, spawn, delegate to, or wait on sub-agents");
     expect(compiled.text).not.toContain("Use non-agent tools directly instead.");
@@ -645,7 +698,7 @@ test("uses the public Instant name without leaking the browser menu alias into t
     { localToolsEnabled: false, solAvailable: true, extraHighAvailable: true, proAvailable: true },
   );
 
-  expect(compiled.text).toContain("This is ChatGPT Web Instant with no Codex Native bridge to the user's local computer");
+  expect(compiled.text).toContain("This is ChatGPT Web Instant with no local Codex bridge");
   expect(compiled.text).not.toContain("Instant 5.5");
 });
 

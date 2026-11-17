@@ -55,7 +55,8 @@ new turn-bound MCP token, and all MCP tool rounds for that message remain inside
 response. On an exact native compaction request, the same Web agent submits the checkpoint through
 a one-shot MCP control call in that chat; only then does the surface close and the next epoch open a
 new chat. The complete named history remains owned by the existing prompt compiler. New
-chats follow the configured **Save chats in ChatGPT** setting (on by default) and use the cheapest
+chats follow **Settings → Temporary Chat** (on by default). Ordinary chats remain in ChatGPT history;
+`dev setup --temporary-chats` and `--ordinary-chats` explicitly select the mode. Chats use the cheapest
 account-supported browser mode:
 Instant (`light`) when Sol is available, otherwise Luna. Override it with `--model` or `/model`.
 
@@ -128,7 +129,7 @@ huge tool result, and its wait is capped at five minutes independently of the no
 After the structured handoff is accepted, the bridge explicitly ends that one-purpose browser turn
 and waits for its physical launcher settlement before closing the old surface; the next epoch then
 starts a fresh chat. This does not depend on ChatGPT rendering assistant text or a Copy
-action after the control-only response. If the retained private chat was already closed, the bridge
+action after the control-only response. If the retained task chat was already closed, the bridge
 starts one read-only fallback chat from the canonical Codex history instead. Browser-only mode
 has no retained MCP boundary and uses the six-message compaction path so its summarizer receives
 the complete expanded history.

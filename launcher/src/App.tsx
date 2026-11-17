@@ -14,6 +14,7 @@ import { createPortal } from "react-dom";
 import { copyFor, localizeRuntimeMessage, type Copy } from "./i18n";
 import { Icon, type IconName } from "./icons";
 import { LimitsSurface } from "./LimitsSurface";
+import { UpdateSettings } from "./UpdateSettings";
 import { limitsCopyFor } from "./limits-copy";
 import { useLimits } from "./useLimits";
 import { describeTurnActivity } from "./turn-activity";
@@ -350,9 +351,7 @@ function LauncherShell({
   snapshot: LauncherSnapshot;
   updateState: (state: LauncherState) => void;
 }) {
-  const interactionSetupComplete = snapshot.state.coreSetupComplete === true
-    && (snapshot.state.browserInteractionMode === "manual"
-      || snapshot.state.codexCatalogVerified === true);
+  const interactionSetupComplete = snapshot.state.coreSetupComplete === true;
   const firstRunZeroRiskSetup = snapshot.state.browserInteractionMode === "manual"
     && snapshot.state.coreSetupComplete !== true;
   const [surface, setSurface] = useState<Surface>(
@@ -363,7 +362,6 @@ function LauncherShell({
   const [sidebarOpen, setSidebarOpen] = useState(!compactAtMount);
   const [compactSidebar, setCompactSidebar] = useState(compactAtMount);
   const [browserSlot, setBrowserSlot] = useState<HTMLDivElement | null>(null);
-  const [sessionReminderBusy, setSessionReminderBusy] = useState(false);
   const [sessionReminderDue, setSessionReminderDue] = useState(false);
   const [mcpTargetMode, setMcpTargetMode] = useState<BrowserInteractionMode | null>(null);
   const [biggerContextRecommendationOpen, setBiggerContextRecommendationOpen] = useState(
@@ -381,7 +379,7 @@ function LauncherShell({
     && browser?.authenticated !== true;
   const needsSetup = !needsBrowser && !interactionSetupComplete;
   const mcpOptional = snapshot.state.browserInteractionMode === "automatic"
-    && snapshot.state.codexCatalogVerified === true
+    && snapshot.state.coreSetupComplete === true
     && snapshot.state.mcpSetupComplete !== true;
   const updateVisible = ["available", "downloading", "installing"].includes(snapshot.update.status);
   const updateBusy = snapshot.update.status === "downloading" || snapshot.update.status === "installing";
@@ -468,6 +466,18 @@ function LauncherShell({
     return () => window.clearTimeout(timer);
   }, [browser?.authenticated, snapshot.state.sessionRefreshReminderAt]);
 
+  useEffect(() => {
+    void api!.setSessionReminderVisible(sessionReminderDue && !biggerContextRecommendationOpen)
+      .catch(cause => setError(messageOf(cause)));
+    return () => { void api!.setSessionReminderVisible(false).catch(cause => setError(messageOf(cause))); };
+  }, [sessionReminderDue, biggerContextRecommendationOpen, language, setError]);
+
+  useEffect(() => api!.onSessionReminderLogout(() => {
+    setSurface("browser");
+    if (compactSidebar) setSidebarOpen(false);
+    void api!.setBrowserSurfaceActive(true).catch(cause => setError(messageOf(cause)));
+  }), [compactSidebar, setError]);
+
   const activateBrowser = useCallback(async (show = false) => {
     setSurface("browser");
     await api!.setBrowserSurfaceActive(true);
@@ -496,35 +506,6 @@ function LauncherShell({
       await api!.installUpdate();
     } catch (cause) {
       setError(messageOf(cause));
-    }
-  };
-
-  const dismissSessionReminder = async () => {
-    if (sessionReminderBusy) return;
-    setSessionReminderBusy(true);
-    setError(null);
-    try {
-      updateState(await api!.dismissSessionReminder());
-    } catch (cause) {
-      setError(messageOf(cause));
-    } finally {
-      setSessionReminderBusy(false);
-    }
-  };
-
-  const logoutChatGpt = async () => {
-    if (sessionReminderBusy) return;
-    setSessionReminderBusy(true);
-    setError(null);
-    try {
-      const result = await api!.logoutChatGpt();
-      updateState(result.state);
-      navigateSurface("browser");
-      await api!.setBrowserSurfaceActive(true);
-    } catch (cause) {
-      setError(messageOf(cause));
-    } finally {
-      setSessionReminderBusy(false);
     }
   };
 
@@ -642,6 +623,10 @@ function LauncherShell({
             </nav>
 
             <div className="sidebar-footer">
+              {snapshot.update.status === "error" ? (
+                <SidebarItem active={false} icon="update" label={copy.updateCheckFailed}
+                  onClick={() => navigateSurface("settings")} />
+              ) : null}
               {updateVisible ? (
                 <SidebarItem
                   active={false}
@@ -779,17 +764,6 @@ function LauncherShell({
             copy={copy}
             onChange={(enabled) => void setRecommendedBiggerContext(enabled)}
             onClose={() => setBiggerContextRecommendationOpen(false)}
-          />
-        ) : null}
-      </AnimatePresence>
-
-      <AnimatePresence>
-        {sessionReminderDue && !biggerContextRecommendationOpen ? (
-          <SessionRefreshReminder
-            busy={sessionReminderBusy}
-            copy={copy}
-            onDismiss={() => void dismissSessionReminder()}
-            onLogout={() => void logoutChatGpt()}
           />
         ) : null}
       </AnimatePresence>
@@ -1258,7 +1232,7 @@ function SetupSurface({
           action={snapshot.state.coreSetupComplete
             ? devProfile ? copy.devReinstall : copy.reinstall
             : devProfile ? copy.devInstall : copy.install}
-          complete={snapshot.state.codexCatalogVerified === true}
+          complete={snapshot.state.coreSetupComplete === true}
           description={devProfile ? copy.devStepInstallBody : copy.stepInstallBody}
           disabled={busy || (!snapshot.smokePassed && snapshot.state.coreSetupComplete !== true)}
           index={manualInteraction ? 1 : 3}
@@ -1285,7 +1259,7 @@ function SetupSurface({
       <SectionHeading label="MCP" meta={manualInteraction ? copy.required : copy.optional} spaced />
       <button
         className="next-surface-row"
-        disabled={!manualInteraction && !snapshot.state.codexCatalogVerified}
+        disabled={!manualInteraction && !snapshot.state.coreSetupComplete}
         onClick={showMcp}
         type="button"
       >
@@ -1414,8 +1388,8 @@ function McpSurface({
       subtitle={devProfile ? copy.devMcpSubtitle : copy.mcpSubtitle}
       title={devProfile ? copy.devMcpTitle : "MCP"}
     >
-      {!manualInteraction && !configuringInactiveMode && !snapshot.state.codexCatalogVerified ? (
-        <NoticeRow icon="setup" tone="warning">{copy.mcpCatalogRequired}</NoticeRow>
+      {!manualInteraction && !configuringInactiveMode && !snapshot.state.coreSetupComplete ? (
+        <NoticeRow icon="setup" tone="warning">{copy.mcpSetupRequired}</NoticeRow>
       ) : null}
 
       <div className="wizard-stepper" aria-label={`${step + 1} / 3`}>
@@ -1529,9 +1503,9 @@ function McpSurface({
             ) : null}
             {step === 1 ? (
               <p className="mcp-step-two-hint">
-                {manualInteraction || configuringInactiveMode || snapshot.state.codexCatalogVerified
+                {manualInteraction || configuringInactiveMode || snapshot.state.coreSetupComplete
                   ? copy.mcpStepTwoHint
-                  : copy.mcpCatalogRequired}
+                  : copy.mcpSetupRequired}
               </p>
             ) : null}
             {step === 2 ? (
@@ -1576,7 +1550,7 @@ function McpSurface({
           <PrimaryButton
             disabled={
               busy
-              || (!manualInteraction && !configuringInactiveMode && !snapshot.state.codexCatalogVerified)
+              || (!manualInteraction && !configuringInactiveMode && !snapshot.state.coreSetupComplete)
               || ((!credentialsConfigured || replacingCredentials) && (!tunnelId || !runtimeKey))
             }
             onClick={() => void install()}
@@ -1717,6 +1691,8 @@ function SettingsSurface({
   const [busy, setBusy] = useState(false);
   const [turnsCancelled, setTurnsCancelled] = useState(false);
   const [integrationRemoved, setIntegrationRemoved] = useState(false);
+  const [confirmBrowserReset, setConfirmBrowserReset] = useState(false);
+  const [browserDataReset, setBrowserDataReset] = useState(false);
   const currentPluginName = snapshot.connectorNames[snapshot.state.browserInteractionMode];
   const [nameSuffix, setNameSuffix] = useState(currentPluginName.slice(6));
   const [confirmNameChange, setConfirmNameChange] = useState(false);
@@ -1823,11 +1799,24 @@ function SettingsSurface({
       setBusy(false);
     }
   };
-  const setUseSavedChats = async (enabled: boolean) => {
+  const setTemporaryChats = async (enabled: boolean) => {
     setBusy(true);
     setError(null);
     try {
-      updateState(await api!.setUseSavedChats(enabled));
+      updateState(await api!.setTemporaryChats(enabled));
+    } catch (cause) {
+      setError(messageOf(cause));
+    } finally {
+      setBusy(false);
+    }
+  };
+  const resetEmbeddedBrowserData = async () => {
+    setBusy(true);
+    setError(null);
+    try {
+      await api!.resetEmbeddedBrowserData();
+      setBrowserDataReset(true);
+      setConfirmBrowserReset(false);
     } catch (cause) {
       setError(messageOf(cause));
     } finally {
@@ -1867,6 +1856,10 @@ function SettingsSurface({
     <ContentSurface narrow title={devProfile ? copy.devSettingsTitle : copy.settingsTitle}>
       <SectionHeading label={copy.general} />
       <div className="settings-list">
+        {snapshot.packaged && snapshot.update.status !== "disabled" ? (
+          <UpdateSettings copy={copy} language={language} update={snapshot.update}
+            version={snapshot.version} onCheck={() => api!.checkForUpdates()} setError={setError} />
+        ) : null}
         {!devProfile ? <SettingRow body={copy.launchAtLoginBody} flushAfter label={copy.launchAtLogin}>
           <Switch
             checked={snapshot.state.autoStart}
@@ -1969,14 +1962,30 @@ function SettingsSurface({
             onChange={(checked) => void setAutoApproveToolCalls(checked)}
           />
         </SettingRow>
-        <SettingRow body={copy.savedChatsBody} label={copy.savedChats}>
+        <SettingRow body={copy.temporaryChatsBody} label={copy.temporaryChats}>
           <Switch
-            checked={snapshot.state.useSavedChats}
+            checked={snapshot.state.useTemporaryChats}
             disabled={busy || snapshot.state.coreSetupComplete !== true}
-            onChange={(checked) => void setUseSavedChats(checked)}
+            onChange={(checked) => void setTemporaryChats(checked)}
           />
         </SettingRow>
-        <SettingRow body={copy.chooseLanguageHint} label={copy.language}>
+        <SettingRow
+          body={confirmBrowserReset ? copy.embeddedBrowserResetConfirm
+            : browserDataReset ? copy.embeddedBrowserResetSuccess : copy.embeddedBrowserResetBody}
+          label={copy.embeddedBrowserReset}
+        >
+          {confirmBrowserReset ? (
+            <div className="manual-turn-actions">
+              <SecondaryButton disabled={busy} onClick={() => setConfirmBrowserReset(false)}>{copy.close}</SecondaryButton>
+              <PrimaryButton disabled={busy} onClick={() => void resetEmbeddedBrowserData()}>{copy.reset}</PrimaryButton>
+            </div>
+          ) : (
+            <SecondaryButton disabled={busy} onClick={() => { setBrowserDataReset(false); setConfirmBrowserReset(true); }}>
+              {copy.reset}
+            </SecondaryButton>
+          )}
+        </SettingRow>
+        <SettingRow body={copy.embeddedBrowserLanguageHint} label={copy.language}>
           <LanguageMenu copy={copy} language={language} onChange={(next) => void updateLanguage(next)} />
         </SettingRow>
       </div>
@@ -2434,9 +2443,7 @@ function DoctorSummary({ copy, language, report }: { copy: Copy; language: Langu
         {visibleChecks.map((check) => (
           <p key={check.id}>
             <StateDot state={check.status === "ok" ? "ready" : check.status === "warning" ? "busy" : "error"} />
-            <span>{check.status === "ok"
-              ? localizeRuntimeMessage(copy, check.message, check.id, language)
-              : check.message}</span>
+            <span>{localizeRuntimeMessage(copy, check.message, check.id, language)}</span>
           </p>
         ))}
       </div>
@@ -2679,7 +2686,7 @@ function ErrorToast({ copy, message, onDismiss }: { copy: Copy; message: string;
   );
 }
 
-function SessionRefreshReminder({
+export function SessionRefreshReminder({
   busy,
   copy,
   onDismiss,
@@ -2794,8 +2801,8 @@ function FatalMessage({ message }: { message: string }) {
 
 function browserTabTitleFromTitle(value: string | undefined, copy: Copy): string {
   const title = value?.trim();
-  if (!title || title === "about:blank" || title.includes("codex-web-gpt-browser-host")) return copy.temporaryChat;
-  return title.replace(/\s*[|–-]\s*ChatGPT\s*$/i, "") || copy.temporaryChat;
+  if (!title || title === "about:blank" || title.includes("codex-web-gpt-browser-host")) return copy.newChat;
+  return title.replace(/\s*[|–-]\s*ChatGPT\s*$/i, "") || copy.newChat;
 }
 
 function browserTabTone(status: BrowserState["tabs"][number]["status"]): "idle" | "ready" | "busy" | "error" {
@@ -2809,9 +2816,6 @@ function formatBrowserAddress(url: string | undefined, copy: Copy): string {
   if (!url || url.startsWith("about:blank")) return copy.browserAddress;
   try {
     const parsed = new URL(url);
-    if (parsed.hostname === "chatgpt.com" && parsed.searchParams.get("temporary-chat") === "true") {
-      return `chatgpt.com  /  ${copy.temporaryChat}`;
-    }
     return `${parsed.hostname}${parsed.pathname === "/" ? "" : parsed.pathname}`;
   } catch {
     return copy.browserAddress;

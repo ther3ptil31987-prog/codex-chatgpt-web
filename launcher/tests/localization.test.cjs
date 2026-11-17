@@ -74,6 +74,13 @@ for (const language of Object.keys(languages).filter(language => language !== "e
     localizeRuntimeMessage(copy, "Responses proxy is healthy on 127.0.0.1:17841", "proxy", language),
     copy.doctorProxyHealthy.replace("{endpoint}", () => "127.0.0.1:17841"),
   );
+  for (const [message, translated] of [
+    ["This runtime has not observed a completed Codex model-list request yet", copy.doctorCatalogPending],
+    ["Codex's latest model-list request succeeded", copy.doctorCatalogReady],
+    ["Codex's latest model-list request failed; the local runtime is reachable", copy.doctorCatalogFailed],
+  ]) {
+    assert.equal(localizeRuntimeMessage(copy, message, "model-catalog", language), translated);
+  }
 });
 
 test("runtime message localization preserves other languages and unknown backend messages", () => {
@@ -120,8 +127,28 @@ test("launcher UI localizes MCP verification progress and doctor check messages"
   assert.match(appSource, /localizeRuntimeMessage\(copy, operation\.message, undefined, language\)/);
   assert.match(
     appSource,
-    /check\.status === "ok"\s*\?\s*localizeRuntimeMessage\(copy, check\.message, check\.id, language\)\s*:\s*check\.message/,
+    /<span>\{localizeRuntimeMessage\(copy, check\.message, check\.id, language\)\}<\/span>/,
   );
+});
+
+test("first-time language selection and Settings explain the embedded browser restart", () => {
+  const { copyFor } = loadI18nModule();
+  assert.match(appSource, /isLanguage\s*\? localized\.chooseLanguageHint/);
+  assert.match(appSource, /<SettingRow body=\{copy\.embeddedBrowserLanguageHint\} label=\{copy\.language\}>/);
+  const english = copyFor("en");
+  assert.match(english.chooseLanguageHint, /first-time setup/);
+  assert.match(english.embeddedBrowserLanguageHint, /Restart required/);
+  assert.match(english.embeddedBrowserLanguageHint, /ChatGPT may use its own saved language setting/);
+  for (const language of Object.keys(languages)) {
+    const copy = copyFor(language);
+    assert.ok(copy.chooseLanguageHint.includes("Codex Web GPT"), language);
+    assert.ok(copy.embeddedBrowserLanguageHint.includes("Codex Web GPT"), language);
+    assert.ok(copy.embeddedBrowserLanguageHint.includes("ChatGPT"), language);
+    if (language !== "en") {
+      assert.notEqual(copy.chooseLanguageHint, english.chooseLanguageHint);
+      assert.notEqual(copy.embeddedBrowserLanguageHint, english.embeddedBrowserLanguageHint);
+    }
+  }
 });
 
 

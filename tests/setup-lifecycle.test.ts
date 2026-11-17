@@ -112,6 +112,11 @@ for (const development of [false, true]) {
       await expect(configure({ ...options, refreshAccountCapabilities: true })).rejects.toThrow("ChatGPT is signed out");
       expect(inspect).toHaveBeenCalledTimes(1);
       expect(save).toHaveBeenCalledTimes(1);
+      inspect.mockRejectedValue(new Error("Could not identify ChatGPT's model controls"));
+      await expect(configure({ ...options, refreshAccountCapabilities: true }))
+        .rejects.toThrow("Could not identify ChatGPT's model controls");
+      expect(save).toHaveBeenCalledTimes(1);
+      expect(existing).toMatchObject({ solAvailable: true, extraHighAvailable: true, proAvailable: true });
     } finally {
       for (const mock of mocks.reverse()) mock.mockRestore();
       rmSync(root, { recursive: true, force: true });
@@ -154,7 +159,6 @@ for (const development of [false, true]) for (const interaction of ["manual", "a
       await listener.stop(true);
       const result = await (development ? setupDevProfile : setup)({ ...options, port,
         ...(interaction === "automatic" ? { experimentalFreshConversationPerTurn: true } : {}),
-        useSavedChats: true,
         connectorNameSuffix: "Work",
       });
       expect(calls).toEqual(development ? ["save"] : ["save", "integrate"]);
@@ -162,7 +166,7 @@ for (const development of [false, true]) for (const interaction of ["manual", "a
       expect(result.tunnelReady).not.toBe(true);
       expect(result.connectorSetupRequired).toBe(true);
       expect(saved?.experimentalFreshConversationPerTurn).toBe(interaction === "automatic");
-      expect(saved?.useSavedChats).toBe(true);
+      expect(saved).not.toHaveProperty("useSavedChats");
       expect(saved?.appName).toBe("Codex Work");
       expect(interaction === "manual" ? saved?.automaticAppName : saved?.manualAppName)
         .toBe(interaction === "automatic" ? "Codex Zero Risk" : development ? "Codex Native2 DEV" : "Codex Native2");
