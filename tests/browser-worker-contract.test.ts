@@ -1,3 +1,4 @@
+import { assertChatGptWebInputWithinLimits, assertChatGptWebMultipartInputWithinLimits, resolveChatGptWebMultipartStagingMode } from "../src/adapters/chatgpt-web/transport-budget";
 import { expect, test } from "bun:test";
 import { mkdtempSync, readFileSync, readdirSync, rmSync } from "node:fs";
 import { EventEmitter } from "node:events";
@@ -5,14 +6,15 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createContext, runInContext } from "node:vm";
 import type { Page } from "playwright-core";
-import { CHATGPT_BROWSER_OBSERVATION_PROBE_TIMEOUT_MS, CHATGPT_COMPLETION_SETTLE_MS, CHATGPT_EXTERNAL_PROGRESS_CLOCK_SKEW_MS, CHATGPT_EXTERNAL_PROGRESS_STALL_CEILING_MS, ChatGptCompletionTracker, chatGptExternalProgressSuppressesDomHealth, CHATGPT_RESPONSE_DOM_GRACE_MS, MAX_CHATGPT_INTERNAL_OBSERVATION_FAULTS, CHATGPT_COMPOSER_DOCUMENT_END_KEY, CHATGPT_COMPOSER_SELECT_ALL_KEY, ChatGptBrowserObservationTimeoutError, ChatGptBrowserWorker, ChatGptSubmissionRejectionObserver, ChatGptPromptAttachmentIntegrityError, ChatGptTurnDomHealthTracker, ChatGptVisibleTraceTracker, MAX_CHATGPT_BROWSER_PAGE_REBINDS, MAX_CHATGPT_BROWSER_TABS, MAX_CHATGPT_CONNECTOR_TRIGGER_ATTEMPTS, assertChatGptWebInputWithinLimits, assertChatGptWebMultipartInputWithinLimits, browserDiagnosticCheckpoint, chatGptNewTurnIdentity, chatGptReboundTurnIdentity, chatGptSubmissionEvidence, connectAfterClosingBrowserConnection, isChatGptTraceControl, redactChatGptUiDiagnostic, resolveBrowserConfig, resolveChatGptToolConfirmation, resolveChatGptWebMultipartStagingMode, sanitizeChatGptBrowserDiagnosticState, setChatGptThinkMode, stripChatGptTraceControlSuffix, throwIfChatGptRateLimitDialog, throwIfChatGptSessionFailureAlert, throwIfChatGptTerminalErrorAlert, withChatGptBrowserObservationTimeout, CHATGPT_MULTIPART_RESPONSE_DOM_GRACE_MS, browserStageTimeouts, ChatGptSuspensionClock, remainingStageBudgetMs } from "../src/adapters/chatgpt-web/browser-worker";
+import { ChatGptWebAdapterError } from "../src/adapters/chatgpt-web/adapter-error";
+import { CHATGPT_BROWSER_OBSERVATION_PROBE_TIMEOUT_MS, CHATGPT_COMPLETION_SETTLE_MS, CHATGPT_EXTERNAL_PROGRESS_CLOCK_SKEW_MS, CHATGPT_EXTERNAL_PROGRESS_STALL_CEILING_MS, ChatGptCompletionTracker, chatGptExternalProgressSuppressesDomHealth, CHATGPT_RESPONSE_DOM_GRACE_MS, MAX_CHATGPT_INTERNAL_OBSERVATION_FAULTS, CHATGPT_COMPOSER_DOCUMENT_END_KEY, CHATGPT_COMPOSER_SELECT_ALL_KEY, ChatGptBrowserObservationTimeoutError, ChatGptBrowserWorker, ChatGptSubmissionRejectionObserver, ChatGptPromptAttachmentIntegrityError, ChatGptTurnDomHealthTracker, ChatGptVisibleTraceTracker, MAX_CHATGPT_BROWSER_PAGE_REBINDS, MAX_CHATGPT_BROWSER_TABS, MAX_CHATGPT_CONNECTOR_TRIGGER_ATTEMPTS, browserDiagnosticCheckpoint, chatGptNewTurnIdentity, chatGptReboundTurnIdentity, chatGptSubmissionEvidence, connectAfterClosingBrowserConnection, isChatGptTraceControl, redactChatGptUiDiagnostic, resolveBrowserConfig, resolveChatGptToolConfirmation, sanitizeChatGptBrowserDiagnosticState, setChatGptThinkMode, stripChatGptTraceControlSuffix, throwIfChatGptRateLimitDialog, throwIfChatGptSessionFailureAlert, throwIfChatGptTerminalErrorAlert, withChatGptBrowserObservationTimeout, CHATGPT_MULTIPART_RESPONSE_DOM_GRACE_MS, browserStageTimeouts, ChatGptSuspensionClock, remainingStageBudgetMs } from "../src/adapters/chatgpt-web/browser-worker";
 import { chatGptUnavailableProDetail } from "../src/adapters/chatgpt-web/browser-worker";
 import { chatGptStoppedThinkingError } from "../src/adapters/chatgpt-web/adapter-error";
 import { CHATGPT_STOPPED_THINKING_LABELS } from "../src/adapters/chatgpt-web/ui-labels";
 import { CHATGPT_WEB_MODEL_ID } from "../src/adapters/chatgpt-web/model";
 import { CHATGPT_CONNECTOR_NAME, DEV_CHATGPT_CONNECTOR_NAME, defaultChromeExecutable, legacyChatGptConnectorMigrationMessage } from "../src/config";
 import { CHATGPT_COMPOSER_SELECTOR, CHATGPT_SEND_BUTTON_SELECTOR, CHATGPT_THINK_BUTTON_SELECTOR } from "../src/chatgpt-ui/composer";
-import { CHATGPT_EFFORT_SLIDER_CONTAINER_SELECTOR, parseChatGptEffortSliderState } from "../src/chatgpt-ui/model-picker";
+import { CHATGPT_ACTIVE_EFFORT_SLIDER_SELECTOR, parseChatGptEffortSliderState } from "../src/chatgpt-ui/model-picker";
 import { ChatGptExternalTurnProgress, chatGptExternalToolCallsAreInFlight } from "../src/adapters/chatgpt-web/turn-progress";
 import type { CodexProviderConfig } from "../src/types";
 import { compileChatGptWebPrompt, formatChatGptWebMultipartCommit, formatChatGptWebMultipartStage } from "../src/adapters/chatgpt-web/prompt";
@@ -1890,7 +1892,7 @@ test("capability inspection records open slider state in safe logs before Escape
       return read(document.querySelector("[data-model-reasoning-effort-slider]")!);
     },
   };
-  const ownedMenu = { isVisible: async () => pickerOpen };
+  const ownedMenu = { isVisible: async () => pickerOpen, locator: () => ({ waitFor: () => new Promise<void>(() => {}) }) };
   const hiddenSurface = {
     filter() { return this; },
     last() { return this; },
@@ -1919,7 +1921,7 @@ test("capability inspection records open slider state in safe logs before Escape
     locator: (selector: string) => {
       if (selector === CHATGPT_COMPOSER_SELECTOR) return composer;
       if (selector === '[id="radix-effort-menu"]') return ownedMenu;
-      if (selector === CHATGPT_EFFORT_SLIDER_CONTAINER_SELECTOR) return sliderContainer;
+      if (selector === CHATGPT_ACTIVE_EFFORT_SLIDER_SELECTOR) return sliderContainer;
       return hiddenSurface;
     },
     keyboard: {
@@ -2422,7 +2424,7 @@ test("each new tool prompt verifies its connector after the previous Send cleare
   expect(prompts).toEqual(["first task", "follow-up task"]);
 });
 
-test("image attachment readiness uses exact file tiles and not localized remove-button text", async () => {
+test.each(["visible", "missing", "page closed"])("image attachment readiness checks the exact file tile (%s)", async outcome => {
   const imageUrl = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
   const calls: Array<[string, string?]> = [];
   const send = {
@@ -2437,14 +2439,17 @@ test("image attachment readiness uses exact file tiles and not localized remove-
       expect(options).toEqual({ name: "codex-input-image-1.png", exact: true });
       return {
         or() { return this; },
+        filter() { return this; },
         waitFor: async (state: { state: string; timeout: number }) => {
-          expect(state).toEqual({ state: "visible", timeout: 60_000 });
+          expect(state).toMatchObject({ state: "visible", timeout: 60_000 });
           calls.push(["fileTile", options.name]);
+          if (outcome === "missing") throw Object.assign(new Error("private file locator"), { name: "TimeoutError" });
+          if (outcome === "page closed") throw new Error("Target page has been closed");
         },
       };
     },
     locator: (selector: string) => {
-      if (selector.startsWith(".composer-attachment-surface")) return {};
+      if (selector.startsWith(".composer-attachment-surface") || selector.startsWith("[data-composer-attachments]")) return {};
       if (selector === 'input[data-testid="upload-photos-input"], input[type="file"][multiple]:not([accept])') return input;
       expect(selector).toBe(CHATGPT_SEND_BUTTON_SELECTOR);
       return send;
@@ -2487,10 +2492,26 @@ test("image attachment readiness uses exact file tiles and not localized remove-
     attachFiles(page: unknown, prompt: unknown): Promise<void>;
   }).attachFiles;
 
-  await attachFiles.call({ activeComposer: async () => composer }, page, {
+  const attach = attachFiles.call({ activeComposer: async () => composer }, page, {
     images: [{ ref: "codex-input-image-1", imageUrl }],
   });
-
+  if (outcome === "missing") {
+    const error = await attach.catch((failure: Error) => failure);
+    expect(error).toBeInstanceOf(ChatGptWebAdapterError);
+    if (!(error instanceof ChatGptWebAdapterError)) throw new Error("Expected an attachment verification error");
+    expect(error.code).toBe("chatgpt_attachment_unconfirmed");
+    expect(error.retryable).toBe(false);
+    expect(error.message).toContain("0/1 attachment previews");
+    expect(error.message).toContain("confirmed 1/1 uploads");
+    expect(error.message).not.toContain("private file");
+    expect(calls.some(([action]) => action === "sendEnabled")).toBe(false);
+    return;
+  }
+  if (outcome === "page closed") {
+    await expect(attach).rejects.toThrow("Target page has been closed");
+    return;
+  }
+  await attach;
   expect(calls).toEqual([
     ["inputReady"],
     ["setFiles", "codex-input-image-1.png"],
@@ -3148,7 +3169,7 @@ test("effort menu waiting stops when ChatGPT reports an expired session", async 
   const composerForm = { locator: () => effortControl };
   const composer = { locator: () => composerForm };
   const effortChoice = { waitFor: async () => await neverVisible };
-  const effortChoices = { nth: () => effortChoice, count: async () => 3 };
+  const effortChoices = { nth: () => effortChoice, count: async () => 3, waitFor: async () => await neverVisible };
   const effortMenu = {
     last() { return this; },
     isVisible: async () => true,
